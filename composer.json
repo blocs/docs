@@ -1,0 +1,27 @@
+{
+    "name": "blocs\/docs",
+    "type": "library",
+    "description": "The document generator for Laravel",
+    "keywords": [
+        "PHP",
+        "Package",
+        "Blocs",
+        "Laravel"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "LINEAR JAPAN Co.,Ltd.",
+            "email": "admin@linear-jp.biz",
+            "role": "Lead Developer"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Blocs\\": "src\/",
+        },
+        "files": [
+            "app\/Helpers\/docs.php"
+        ]
+    }
+}
