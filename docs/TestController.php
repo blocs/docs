@@ -1,10 +1,10 @@
 <?php
 
 $config = [
-    'description' => '',
+    'description' => '画面名',
     'keyword' => [],
-    'method' => [
-        'description' => '',
+    'index' => [
+        'description' => 'メソッド概要',
         'neglect' => [],
         'keyword' => [],
         'comment' => [],

@@ -23,6 +23,9 @@ class Docs
         // コントローラー、メソッドを取得
         $currentRouteAction = explode('\\', Route::currentRouteAction());
         $currentRouteAction = end($currentRouteAction);
+        if (empty($currentRouteAction) || !file_exists(base_path('docs/format.xlsx'))) {
+            return $response;
+        }
         list($routeClass, $routeMethod) = explode('@', $currentRouteAction, 2);
 
         // エクセルを準備
@@ -60,9 +63,9 @@ class Docs
 
         foreach ($steps as $stepNo => $step) {
             // 非表示行
-            $stepMain = implode('', $step['process']);
-            $stepMain = $this->replaceMain($stepMain);
-            if ($this->checkNeglect($stepMain)) {
+            $stepProcess = implode('', $step['process']);
+            $stepProcess = $this->replaceProcess($stepProcess);
+            if ($this->checkNeglect($stepProcess)) {
                 continue;
             }
 
@@ -73,7 +76,7 @@ class Docs
             $line > $maxLine && $maxLine = $line;
 
             // 処理機能を記述
-            $line = $this->writeMain($startLine, $step, $excel, $headlineNo, $indentNo);
+            $line = $this->writeProcess($startLine, $step, $excel, $headlineNo, $indentNo);
             $line > $maxLine && $maxLine = $line;
 
             // 出力を記述
@@ -106,7 +109,7 @@ class Docs
         return ++$line;
     }
 
-    private function writeMain($line, $step, $excel, &$headlineNo, &$indentNo)
+    private function writeProcess($line, $step, $excel, &$headlineNo, &$indentNo)
     {
         foreach ($step['process'] as $process) {
             $comments = explode("\n", $process);
@@ -117,7 +120,7 @@ class Docs
             $headline && $process = trim(substr($process, 1));
 
             $column = $headline ? 'K' : 'L';
-            $process = $this->replaceMain($process);
+            $process = $this->replaceProcess($process);
             if ($headline) {
                 // 見出し
                 $excel->set(1, $column, $line, $headlineNo.'. '.$process);
@@ -144,7 +147,7 @@ class Docs
             }
 
             foreach ($comments as $comment) {
-                $excel->set(1, $column, $line, $this->replaceMain($comment));
+                $excel->set(1, $column, $line, $this->replaceProcess($comment));
                 ++$line;
             }
         }
@@ -182,6 +185,9 @@ class Docs
         $neglect = [];
         $comment = [];
 
+        $excel->set(1, 'AU', '1', date('Y/m/d'));
+        $excel->set(1, 'E', '2', $routeClass.'@'.$routeMethod);
+
         if (file_exists(base_path('docs/common.php'))) {
             include base_path('docs/common.php');
 
@@ -195,8 +201,6 @@ class Docs
 
             // class、method概要を記述
             isset($config['description']) && $excel->set(1, 'Z', '1', $config['description']);
-            $excel->set(1, 'AU', '1', date('Y/m/d'));
-            $excel->set(1, 'E', '2', $routeClass.'@'.$routeMethod);
             isset($config[$routeMethod]['description']) && $excel->set(1, 'Q', '2', $config[$routeMethod]['description']);
 
             // キーワードを取得
@@ -236,7 +240,7 @@ class Docs
         return $item;
     }
 
-    private function replaceMain($item)
+    private function replaceProcess($item)
     {
         foreach ($this->keyword as $key => $value) {
             // キーワード置き換え

@@ -89,7 +89,7 @@ trait ExcelSetTrait
 
         $excelTemplate = $this->excelTemplate;
 
-        $tempName = tempnam(BLOCS_CACHE_DIR, 'excel');
+        $tempName = tempnam(config('view.compiled'), 'excel');
         $generateName = $tempName.'.zip';
         $excelGenerate = new \ZipArchive();
         $excelGenerate->open($generateName, \ZipArchive::CREATE);
