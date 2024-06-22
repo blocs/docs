@@ -44,7 +44,7 @@ class Docs
         if (count($steps)) {
             $endNo = count($steps) - 1;
 
-            if (!$steps[$endNo]['in'] && 200 === $response->getStatusCode()) {
+            if (!$steps[$endNo]['in'] && 200 === $response->getStatusCode() && method_exists($response->original, 'getPath')) {
                 // 画面表示の入力を記述
                 $viewPath = str_replace(resource_path('views/'), '', $response->original->getPath());
                 $viewPath && $steps[$endNo]['in'] = ['テンプレート' => $viewPath];
@@ -232,6 +232,10 @@ class Docs
 
     private function replaceInOut($item)
     {
+        if (!strncmp($item, '!', 1)) {
+            return substr($item, 1);
+        }
+
         foreach ($this->keyword as $key => $value) {
             // キーワード置き換え
             $item = str_replace($key, $key.': '.$value, $item);
@@ -242,6 +246,10 @@ class Docs
 
     private function replaceProcess($item)
     {
+        if (!strncmp($item, '!', 1)) {
+            return substr($item, 1);
+        }
+
         foreach ($this->keyword as $key => $value) {
             // キーワード置き換え
             $item = str_replace('<'.$key.'>', '<'.$value.'>', $item);
