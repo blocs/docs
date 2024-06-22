@@ -236,9 +236,17 @@ class Docs
             return substr($item, 1);
         }
 
-        foreach ($this->keyword as $key => $value) {
-            // キーワード置き換え
-            $item = str_replace($key, $key.': '.$value, $item);
+        // キーワードを長い順にソート
+        $keywords = array_keys($this->keyword);
+        array_multisort(array_map('strlen', $keywords), SORT_DESC, $keywords);
+
+        foreach ($keywords as $key) {
+            if (false !== strpos($item, $key)) {
+                // キーワード置き換え
+                $item = str_replace($key, $key.': '.$this->keyword[$key], $item);
+
+                return $item;
+            }
         }
 
         return $item;
