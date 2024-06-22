@@ -47,7 +47,7 @@ class Docs
             if (!$steps[$endNo]['in'] && 200 === $response->getStatusCode() && method_exists($response->original, 'getPath')) {
                 // 画面表示の入力を記述
                 $viewPath = str_replace(resource_path('views/'), '', $response->original->getPath());
-                $viewPath && $steps[$endNo]['in'] = ['テンプレート' => $viewPath];
+                $viewPath && $steps[$endNo]['in'] = ['テンプレート' => '!'.$viewPath];
             }
 
             if (!$steps[$endNo]['out']) {
@@ -55,7 +55,7 @@ class Docs
                 if (200 === $response->getStatusCode()) {
                     $contents = str_replace(["\r\n", "\r", "\n"], '', $response->getContent());
                     if (preg_match('/<title>(.*?)<\/title>/i', $contents, $match)) {
-                        $steps[$endNo]['out'] = ['HTML' => trim($match[1])];
+                        $steps[$endNo]['out'] = ['HTML' => '!'.trim($match[1])];
                     }
                 }
             }
