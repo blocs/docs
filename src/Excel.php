@@ -54,7 +54,7 @@ class Excel
     /**
      * @param string $sheetNo シートの番号、左から1,2とカウント
      */
-    public function all($sheetNo)
+    public function all($sheetNo, $columns = [])
     {
         // 指定されたシートの読み込み
         $sheetName = 'xl/worksheets/sheet'.$this->getSheetNo($sheetNo).'.xml';
@@ -74,15 +74,21 @@ class Excel
             foreach ($row->c as $cell) {
                 while ($this->getColumnName($columnIndex).$row['r'] != $cell['r']) {
                     // 空白セルを追加
-                    $rowData[] = '';
+                    if (empty($columns) || in_array($columnIndex, $columns)) {
+                        $rowData[] = '';
+                    }
                     ++$columnIndex;
                 }
 
                 if ('s' == $cell['t']) {
                     // 文字列の時
-                    $rowData[] = strval($this->getValue(intval($cell->v)));
+                    if (empty($columns) || in_array($columnIndex, $columns)) {
+                        $rowData[] = strval($this->getValue(intval($cell->v)));
+                    }
                 } else {
-                    $rowData[] = strval($cell->v);
+                    if (empty($columns) || in_array($columnIndex, $columns)) {
+                        $rowData[] = strval($cell->v);
+                    }
                 }
                 ++$columnIndex;
             }
