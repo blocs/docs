@@ -21,7 +21,7 @@
             "Blocs\\": "src\/"
         },
         "files": [
-            "app\/Helpers\/docs.php"
+            "helper\/docs.php"
         ]
     }
 }
