@@ -21,4 +21,4 @@ composerで導入してください。
 laravel-app % composer require blocs/docs
 ```
 
-[Qiita:【Laravel】ドキュメント生成ツールを作ってみた！](https://qiita.com/hyada/items/527680b07bf0f6e61398)
+[Qiita:【Laravel】ドキュメント生成ツールを作ってみた](https://qiita.com/hyada/items/c40ae6a8fc6fff05c243)
