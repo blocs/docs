@@ -1,7 +1,7 @@
 {
     "name": "blocs\/docs",
     "type": "library",
-    "description": "The document generator for Laravel",
+    "description": "Laravel document generator",
     "keywords": [
         "PHP",
         "Package",
