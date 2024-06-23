@@ -1,7 +1,7 @@
 <div align="center"><img src="logo.svg" width="400" /></div>
 
-# The document generator for Laravel
-Laravelのためのドキュメント生成ツール
+# Laravel document generator
+Laravelのドキュメント生成ツール
 
 [![Latest stable version](https://img.shields.io/packagist/v/blocs/docs)](https://packagist.org/packages/blocs/docs)
 [![Total downloads](https://img.shields.io/packagist/dt/blocs/docs)](https://packagist.org/packages/blocs/docs)
