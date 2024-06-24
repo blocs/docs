@@ -1,25 +1,25 @@
 <?php
 
 if (!function_exists('docs')) {
-    function docs(...$argvs)
+    function docs(...$arguments)
     {
         if (!isset($GLOBALS['DOC_GENERATOR'])) {
             return;
         }
 
-        if (count($argvs) > 2) {
-            $in = $argvs[0] ?? [];
-            $process = $argvs[1] ?? [];
-            $out = $argvs[2] ?? [];
-            $validate = $argvs[3] ?? [];
-        } elseif (count($argvs) > 1) {
-            $in = $argvs[0] ?? [];
-            $process = $argvs[1] ?? [];
+        if (count($arguments) > 2) {
+            $in = $arguments[0] ?? [];
+            $process = $arguments[1] ?? [];
+            $out = $arguments[2] ?? [];
+            $validate = $arguments[3] ?? [];
+        } elseif (count($arguments) > 1) {
+            $in = $arguments[0] ?? [];
+            $process = $arguments[1] ?? [];
             $out = [];
             $validate = [];
         } else {
             $in = [];
-            $process = $argvs[0] ?? [];
+            $process = $arguments[0] ?? [];
             $out = [];
             $validate = [];
         }
