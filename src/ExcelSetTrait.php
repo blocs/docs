@@ -89,7 +89,13 @@ trait ExcelSetTrait
 
         $excelTemplate = $this->excelTemplate;
 
-        $tempName = tempnam(config('view.compiled'), 'excel');
+        // テンポラリファイル作成
+        if (function_exists('config')) {
+            $tempName = tempnam(config('view.compiled'), 'excel');
+        } else {
+            $tempName = tempnam(sys_get_temp_dir(), 'excel');
+        }
+
         $generateName = $tempName.'.zip';
         $excelGenerate = new \ZipArchive();
         $excelGenerate->open($generateName, \ZipArchive::CREATE);
