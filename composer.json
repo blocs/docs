@@ -4,9 +4,8 @@
     "description": "Laravel document generator",
     "keywords": [
         "PHP",
-        "Package",
-        "Blocs",
-        "Laravel"
+        "Laravel",
+        "Package"
     ],
     "license": "MIT",
     "authors": [
