@@ -44,7 +44,7 @@ class Docs
         if (count($steps)) {
             $endNo = count($steps) - 1;
 
-            if (!$steps[$endNo]['in'] && 200 === $response->getStatusCode() && method_exists($response->original, 'getPath')) {
+            if (!$steps[$endNo]['in'] && 200 === $response->getStatusCode() && is_object($response->original) && method_exists($response->original, 'getPath')) {
                 // 画面表示の入力を記述
                 $viewPath = str_replace(resource_path('views/'), '', $response->original->getPath());
                 $viewPath && $steps[$endNo]['in'] = ['テンプレート' => '!'.$viewPath];
