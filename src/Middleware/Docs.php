@@ -21,8 +21,8 @@ class Docs
         $response = $next($request);
 
         // コントローラー、メソッドを取得
-        $currentRouteAction = explode('\\', Route::currentRouteAction());
-        $currentRouteAction = end($currentRouteAction);
+        $currentRouteAction = ltrim(str_replace('\\', '/', Route::currentRouteAction()), '/');
+        $currentRouteAction = str_replace('App/Http/Controllers/', '', $currentRouteAction);
         if (empty($currentRouteAction) || !file_exists(base_path('docs/format.xlsx'))) {
             return $response;
         }
@@ -30,6 +30,7 @@ class Docs
 
         // エクセルを準備
         $excelPath = base_path("docs/{$currentRouteAction}.xlsx");
+        is_dir(dirname($excelPath)) || mkdir(dirname($excelPath), 0777, true);
         copy(base_path('docs/format.xlsx'), $excelPath);
         $excel = new Excel($excelPath);
 
