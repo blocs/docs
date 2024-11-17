@@ -20,12 +20,14 @@ class Docs
 
         $response = $next($request);
 
+        if (!file_exists(base_path('docs/format.xlsx'))) {
+            return $response;
+        }
+
         // コントローラー、メソッドを取得
         $currentRouteAction = ltrim(str_replace('\\', '/', Route::currentRouteAction()), '/');
         $currentRouteAction = str_replace('App/Http/Controllers/', '', $currentRouteAction);
-        if (empty($currentRouteAction) || !file_exists(base_path('docs/format.xlsx'))) {
-            return $response;
-        }
+        empty($currentRouteAction) && $currentRouteAction = 'class@method';
         list($routeClass, $routeMethod) = explode('@', $currentRouteAction, 2);
 
         // エクセルを準備
