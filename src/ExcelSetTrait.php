@@ -296,7 +296,7 @@ trait ExcelSetTrait
 
         foreach ($this->addSharedString as $value) {
             $addString = $sharedXml->addChild('si');
-            $addString->addChild('t', $value);
+            $addString->addChild('t', str_replace('&', '&amp;', $value));
         }
 
         $this->worksheetXml[$this->sharedName] = $sharedXml;
@@ -305,7 +305,7 @@ trait ExcelSetTrait
     private function appendChild(\SimpleXMLElement $target, \SimpleXMLElement $addElement)
     {
         if ('' !== strval($addElement)) {
-            $child = $target->addChild($addElement->getName(), strval($addElement));
+            $child = $target->addChild($addElement->getName(), str_replace('&', '&amp;', strval($addElement)));
         } else {
             $child = $target->addChild($addElement->getName());
         }
