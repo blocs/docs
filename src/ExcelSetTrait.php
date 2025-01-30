@@ -58,7 +58,7 @@ trait ExcelSetTrait
 
         return response($this->generate())
             ->header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            ->header('Content-Disposition', 'filename*=UTF-8\'\''.$filename)
+            ->header('Content-Disposition', 'inline;filename*=UTF-8\'\''.$filename)
             ->header('Cache-Control', 'max-age=0');
     }
 
