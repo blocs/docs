@@ -30,7 +30,7 @@ class Excel
      * @param string $sheetNo     シートの番号、左から1,2とカウント
      * @param string $sheetColumn 編集するカラムの列番号、もしくは列名
      * @param string $sheetRow    編集するカラムの行番号、もしくは行名
-     * @param bool $formula       式を取得する場合は true
+     * @param bool   $formula     式を取得する場合は true
      */
     public function get($sheetNo, $sheetColumn, $sheetRow, $formula = false)
     {
