@@ -30,8 +30,9 @@ class Excel
      * @param string $sheetNo     シートの番号、左から1,2とカウント
      * @param string $sheetColumn 編集するカラムの列番号、もしくは列名
      * @param string $sheetRow    編集するカラムの行番号、もしくは行名
+     * @param bool   $formula     式を取得する場合は true
      */
-    public function get($sheetNo, $sheetColumn, $sheetRow)
+    public function get($sheetNo, $sheetColumn, $sheetRow, $formula = false)
     {
         // 指定されたシートの読み込み
         $sheetName = 'xl/worksheets/sheet'.$this->getSheetNo($sheetNo).'.xml';
@@ -46,7 +47,7 @@ class Excel
         list($columnName, $rowName) = $this->getName($sheetColumn, $sheetRow);
 
         // 指定されたセルの値を取得
-        $value = $this->getValueSheet($worksheetXml, $columnName, $rowName);
+        $value = $this->getValueSheet($worksheetXml, $columnName, $rowName, $formula);
 
         return $value;
     }
@@ -174,7 +175,7 @@ class Excel
         return $columnName;
     }
 
-    private function getValueSheet($worksheetXml, $columnName, $rowName)
+    private function getValueSheet($worksheetXml, $columnName, $rowName, $formula = false)
     {
         $cellName = $columnName.$rowName;
 
@@ -188,9 +189,17 @@ class Excel
                 if ($cell['r'] == $cellName) {
                     if ('s' == $cell['t']) {
                         // 文字列の時
-                        return strval($this->getValue(intval($cell->v)));
+                        if ($formula) {
+                            return strval($this->getValue(intval($cell->f)));
+                        } else {
+                            return strval($this->getValue(intval($cell->v)));
+                        }
                     } else {
-                        return strval($cell->v);
+                        if ($formula) {
+                            return strval($cell->f);
+                        } else {
+                            return strval($cell->v);
+                        }
                     }
                 }
             }
