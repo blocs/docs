@@ -252,9 +252,6 @@ trait ExcelSetTrait
             return;
         }
 
-        // SimpleXMLElementの変換もれに対応
-        $value = str_replace('&', '&amp;', $value);
-
         isset($this->sharedString) || $this->getSharedString();
 
         // 文字列を追加
