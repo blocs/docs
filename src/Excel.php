@@ -104,16 +104,36 @@ class Excel
         return $allData;
     }
 
-    private function getWorksheetString($sheetName)
+    public function sheetNames()
+    {
+        return array_keys($this->getSheetNo());
+    }
+
+    private function getWorksheetFile($sheetName)
     {
         // シートがない時
         if (empty($this->excelTemplate->numFiles)) {
             return false;
         }
 
-        $worksheetString = $this->excelTemplate->getFromName($sheetName);
+        // テンポラリファイル作成
+        if (function_exists('config')) {
+            $tempName = tempnam(config('view.compiled'), 'excel');
+        } else {
+            $tempName = tempnam(sys_get_temp_dir(), 'excel');
+        }
 
-        return $worksheetString;
+        $fp = $this->excelTemplate->getStream($sheetName);
+        if (!$fp) {
+            return false;
+        }
+
+        while (!feof($fp)) {
+            file_put_contents($tempName, fread($fp, 1024 * 1024), FILE_APPEND);
+        }
+        fclose($fp);
+
+        return $tempName;
     }
 
     private function getWorksheetXml($sheetName)
@@ -123,20 +143,22 @@ class Excel
             return $this->worksheetXml[$sheetName];
         }
 
-        $worksheetString = $this->getWorksheetString($sheetName);
+        $tempName = $this->getWorksheetFile($sheetName);
 
         // シートがない時
-        if (empty($worksheetString)) {
+        if (!$tempName) {
             return false;
         }
 
         // キャッシュを作成
-        $this->worksheetXml[$sheetName] = new \SimpleXMLElement($worksheetString);
+        $this->worksheetXml[$sheetName] = simplexml_load_file($tempName);
+
+        is_file($tempName) && unlink($tempName);
 
         return $this->worksheetXml[$sheetName];
     }
 
-    private function getSheetNo($sheetName)
+    private function getSheetNo($sheetName = null)
     {
         $worksheetXml = $this->getWorksheetXml('xl/workbook.xml');
         $sheets = $worksheetXml->sheets[0]->sheet;
@@ -145,6 +167,10 @@ class Excel
         $sheetNames = [];
         foreach ($sheets as $sheet) {
             $sheetNames[strval($sheet->attributes()->name)] = ++$sheetNo;
+        }
+
+        if (!isset($sheetName)) {
+            return $sheetNames;
         }
 
         return isset($sheetNames[$sheetName]) ? $sheetNames[$sheetName] : $sheetName;
