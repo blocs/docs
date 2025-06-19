@@ -16,6 +16,9 @@ class Excel
     private $worksheetXml = [];
     private $sharedName = 'xl/sharedStrings.xml';
 
+    private $fp;
+    private $tempName;
+
     /**
      * @param string $excelName テンプレートファイル名
      */
@@ -96,12 +99,58 @@ class Excel
 
             while (count(array_keys($allData)) + 1 < $row['r']) {
                 // 空白行を追加
+                if (isset($this->tempName)) {
+                    file_put_contents($this->tempName, json_encode([])."\n", FILE_APPEND);
+                }
                 $allData[] = [];
             }
-            $allData[] = $rowData;
+
+            if (isset($this->tempName)) {
+                file_put_contents($this->tempName, json_encode($rowData)."\n", FILE_APPEND);
+                $allData[] = [];
+            } else {
+                $allData[] = $rowData;
+            }
         }
 
         return $allData;
+    }
+
+    public function open($sheetNo, $columns = [])
+    {
+        // テンポラリファイル作成
+        $this->tempName = $this->generateTempName();
+
+        $this->all($sheetNo, $columns);
+
+        is_file($this->tempName) && $this->fp = @fopen($this->tempName, 'r');
+    }
+
+    public function first()
+    {
+        if (!$this->fp) {
+            $this->close();
+
+            return false;
+        }
+
+        if (($buff = fgets($this->fp)) !== false) {
+            return json_decode($buff, true);
+        }
+
+        $this->close();
+
+        return false;
+    }
+
+    public function close()
+    {
+        fclose($this->fp);
+        $this->fp = null;
+
+        // テンポラリファイル削除
+        is_file($this->tempName) && unlink($this->tempName);
+        $this->tempName = null;
     }
 
     public function sheetNames()
@@ -116,17 +165,13 @@ class Excel
             return false;
         }
 
-        // テンポラリファイル作成
-        if (function_exists('config')) {
-            $tempName = tempnam(config('view.compiled'), 'excel');
-        } else {
-            $tempName = tempnam(sys_get_temp_dir(), 'excel');
-        }
-
         $fp = $this->excelTemplate->getStream($sheetName);
         if (!$fp) {
             return false;
         }
+
+        // テンポラリファイル作成
+        $tempName = $this->generateTempName();
 
         while (!feof($fp)) {
             file_put_contents($tempName, fread($fp, 1024 * 1024), FILE_APPEND);
@@ -264,5 +309,15 @@ class Excel
         }
 
         return false;
+    }
+
+    private function generateTempName()
+    {
+        // テンポラリファイル作成
+        if (function_exists('config')) {
+            return tempnam(config('view.compiled'), 'excel');
+        }
+
+        return tempnam(sys_get_temp_dir(), 'excel');
     }
 }
