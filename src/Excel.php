@@ -303,6 +303,9 @@ class Excel
                 // 装飾されていない文字列を取得
                 isset($sharedSi->t) && $string .= strval($sharedSi->t);
 
+                // 制御文字を削除
+                $string = str_replace('_x000D_', '', $string);
+
                 return $string;
             }
             ++$sharedIndex;
