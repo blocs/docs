@@ -11,29 +11,32 @@ class Excel
     use ExcelSetTrait;
 
     private $excelName;
+
     private $excelTemplate;
 
     private $worksheetXml = [];
+
     private $sharedName = 'xl/sharedStrings.xml';
 
     private $fp;
+
     private $tempName;
 
     /**
-     * @param string $excelName テンプレートファイル名
+     * @param  string  $excelName  テンプレートファイル名
      */
     public function __construct($excelName)
     {
         $this->excelName = $excelName;
-        $this->excelTemplate = new \ZipArchive();
+        $this->excelTemplate = new \ZipArchive;
         $this->excelTemplate->open($excelName);
     }
 
     /**
-     * @param string $sheetNo     シートの番号、左から1,2とカウント
-     * @param string $sheetColumn 編集するカラムの列番号、もしくは列名
-     * @param string $sheetRow    編集するカラムの行番号、もしくは行名
-     * @param bool   $formula     式を取得する場合は true
+     * @param  string  $sheetNo  シートの番号、左から1,2とカウント
+     * @param  string  $sheetColumn  編集するカラムの列番号、もしくは列名
+     * @param  string  $sheetRow  編集するカラムの行番号、もしくは行名
+     * @param  bool  $formula  式を取得する場合は true
      */
     public function get($sheetNo, $sheetColumn, $sheetRow, $formula = false)
     {
@@ -42,12 +45,12 @@ class Excel
         $worksheetXml = $this->getWorksheetXml($sheetName);
 
         // 指定されたシートがない
-        if (false === $worksheetXml) {
+        if ($worksheetXml === false) {
             return false;
         }
 
         // 列番号、行番号を列名、行名に変換
-        list($columnName, $rowName) = $this->getName($sheetColumn, $sheetRow);
+        [$columnName, $rowName] = $this->getName($sheetColumn, $sheetRow);
 
         // 指定されたセルの値を取得
         $value = $this->getValueSheet($worksheetXml, $columnName, $rowName, $formula);
@@ -56,7 +59,7 @@ class Excel
     }
 
     /**
-     * @param string $sheetNo シートの番号、左から1,2とカウント
+     * @param  string  $sheetNo  シートの番号、左から1,2とカウント
      */
     public function all($sheetNo, $columns = [])
     {
@@ -65,7 +68,7 @@ class Excel
         $worksheetXml = $this->getWorksheetXml($sheetName);
 
         // 指定されたシートがない
-        if (false === $worksheetXml) {
+        if ($worksheetXml === false) {
             return false;
         }
 
@@ -81,10 +84,10 @@ class Excel
                     if (empty($columns) || in_array($columnIndex, $columns)) {
                         $rowData[] = '';
                     }
-                    ++$columnIndex;
+                    $columnIndex++;
                 }
 
-                if ('s' == $cell['t']) {
+                if ($cell['t'] == 's') {
                     // 文字列の時
                     if (empty($columns) || in_array($columnIndex, $columns)) {
                         $rowData[] = strval($this->getValue(intval($cell->v)));
@@ -94,7 +97,7 @@ class Excel
                         $rowData[] = strval($cell->v);
                     }
                 }
-                ++$columnIndex;
+                $columnIndex++;
             }
 
             while (count(array_keys($allData)) + 1 < $row['r']) {
@@ -128,7 +131,7 @@ class Excel
 
     public function first()
     {
-        if (!$this->fp) {
+        if (! $this->fp) {
             $this->close();
 
             return false;
@@ -166,14 +169,14 @@ class Excel
         }
 
         $fp = $this->excelTemplate->getStream($sheetName);
-        if (!$fp) {
+        if (! $fp) {
             return false;
         }
 
         // テンポラリファイル作成
         $tempName = $this->generateTempName();
 
-        while (!feof($fp)) {
+        while (! feof($fp)) {
             file_put_contents($tempName, fread($fp, 1024 * 1024), FILE_APPEND);
         }
         fclose($fp);
@@ -191,7 +194,7 @@ class Excel
         $tempName = $this->getWorksheetFile($sheetName);
 
         // シートがない時
-        if (!$tempName) {
+        if (! $tempName) {
             return false;
         }
 
@@ -214,7 +217,7 @@ class Excel
             $sheetNames[strval($sheet->attributes()->name)] = ++$sheetNo;
         }
 
-        if (!isset($sheetName)) {
+        if (! isset($sheetName)) {
             return $sheetNames;
         }
 
@@ -223,8 +226,8 @@ class Excel
 
     private function getName($sheetColumn, $sheetRow)
     {
-        is_integer($sheetColumn) && $sheetColumn = $this->getColumnName($sheetColumn);
-        is_integer($sheetRow) && $sheetRow = $sheetRow + 1;
+        is_int($sheetColumn) && $sheetColumn = $this->getColumnName($sheetColumn);
+        is_int($sheetRow) && $sheetRow = $sheetRow + 1;
 
         return [$sheetColumn, $sheetRow];
     }
@@ -258,7 +261,7 @@ class Excel
 
             foreach ($row->c as $cell) {
                 if ($cell['r'] == $cellName) {
-                    if ('s' == $cell['t']) {
+                    if ($cell['t'] == 's') {
                         // 文字列の時
                         if ($formula) {
                             return strval($this->getValue(intval($cell->f)));
@@ -285,7 +288,7 @@ class Excel
         $sharedXml = $this->getWorksheetXml($this->sharedName);
 
         // 共通ファイルがない時
-        if (false === $sharedXml) {
+        if ($sharedXml === false) {
             return false;
         }
 
@@ -308,7 +311,7 @@ class Excel
 
                 return $string;
             }
-            ++$sharedIndex;
+            $sharedIndex++;
         }
 
         return false;

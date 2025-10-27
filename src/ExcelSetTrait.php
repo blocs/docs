@@ -9,18 +9,20 @@ namespace Blocs;
 trait ExcelSetTrait
 {
     private $sharedString;
+
     private $setValue = [];
 
     private $addShared = false;
+
     private $addSharedString = [];
 
     private $sheetName = [];
 
     /**
-     * @param string $sheetNo     シートの番号、左から1,2とカウント
-     * @param string $sheetColumn 編集するカラムの列番号、もしくは列名
-     * @param string $sheetRow    編集するカラムの行番号、もしくは行名
-     * @param string $value       値
+     * @param  string  $sheetNo  シートの番号、左から1,2とカウント
+     * @param  string  $sheetColumn  編集するカラムの列番号、もしくは列名
+     * @param  string  $sheetRow  編集するカラムの行番号、もしくは行名
+     * @param  string  $value  値
      */
     public function set($sheetNo, $sheetColumn, $sheetRow, $value)
     {
@@ -29,12 +31,12 @@ trait ExcelSetTrait
         $worksheetXml = $this->getWorksheetXml($sheetName);
 
         // 指定されたシートがない
-        if (false === $worksheetXml) {
+        if ($worksheetXml === false) {
             return false;
         }
 
         // 列番号、行番号を列名、行名に変換
-        list($columnName, $rowName) = $this->getName($sheetColumn, $sheetRow);
+        [$columnName, $rowName] = $this->getName($sheetColumn, $sheetRow);
 
         $this->setValue[$sheetName][$rowName][$columnName.$rowName] = $value;
 
@@ -97,14 +99,14 @@ trait ExcelSetTrait
         }
 
         $generateName = $tempName.'.zip';
-        $excelGenerate = new \ZipArchive();
+        $excelGenerate = new \ZipArchive;
         $excelGenerate->open($generateName, \ZipArchive::CREATE);
 
-        for ($i = 0; $i < $excelTemplate->numFiles; ++$i) {
+        for ($i = 0; $i < $excelTemplate->numFiles; $i++) {
             $sheetName = $excelTemplate->getNameIndex($i);
             $worksheetString = $excelTemplate->getFromIndex($i);
 
-            if ('xl/workbook.xml' == $sheetName) {
+            if ($sheetName == 'xl/workbook.xml') {
                 $worksheetXml = $this->getWorksheetXml($sheetName);
 
                 // シート名を変更
@@ -118,6 +120,7 @@ trait ExcelSetTrait
                 if (isset($worksheetXml->calcPr['forceFullCalc'])) {
                     // テンプレートそのままのシート
                     $excelGenerate->addFromString($sheetName, $worksheetString);
+
                     continue;
                 }
 
@@ -131,6 +134,7 @@ trait ExcelSetTrait
             if (isset($this->worksheetXml[$sheetName])) {
                 // 値を差し替えたシート
                 $excelGenerate->addFromString($sheetName, $this->worksheetXml[$sheetName]->asXML());
+
                 continue;
             }
 
@@ -165,7 +169,7 @@ trait ExcelSetTrait
             foreach ($row->c as $cell) {
                 $cellName = strval($cell['r']);
 
-                if (!isset($setValue[$rowName][$cellName])) {
+                if (! isset($setValue[$rowName][$cellName])) {
                     continue;
                 }
 
@@ -256,7 +260,7 @@ trait ExcelSetTrait
 
         // 文字列を追加
         $stringIndex = array_search($value, $this->sharedString);
-        if (false === $stringIndex) {
+        if ($stringIndex === false) {
             $this->sharedString[] = $value;
             $this->addSharedString[] = $value;
             $stringIndex = count($this->sharedString) - 1;
@@ -273,7 +277,7 @@ trait ExcelSetTrait
         $sharedXml = $this->getWorksheetXml($this->sharedName);
 
         // 共通ファイルがない時は作成
-        false === $sharedXml && $sharedXml = $this->addShared();
+        $sharedXml === false && $sharedXml = $this->addShared();
 
         // 共通ファイルで文字列を検索すること
         $this->sharedString = [];
@@ -301,7 +305,7 @@ trait ExcelSetTrait
 
     private function appendChild(\SimpleXMLElement $target, \SimpleXMLElement $addElement)
     {
-        if ('' !== strval($addElement)) {
+        if (strval($addElement) !== '') {
             $child = $target->addChild($addElement->getName(), str_replace('&', '&amp;', strval($addElement)));
         } else {
             $child = $target->addChild($addElement->getName());
@@ -321,19 +325,19 @@ trait ExcelSetTrait
 
         $contentString = $this->getWorksheetString('[Content_Types].xml');
         $contentString = substr($contentString, 0, -8);
-        $contentString .= <<< END_of_HTML
+        $contentString .= <<< 'END_of_HTML'
 <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>
 END_of_HTML;
         $this->worksheetXml['[Content_Types].xml'] = new \SimpleXMLElement($contentString);
 
         $relsString = $this->getWorksheetString('xl/_rels/workbook.xml.rels');
         $relsString = substr($relsString, 0, -16);
-        $relsString .= <<< END_of_HTML
+        $relsString .= <<< 'END_of_HTML'
 <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>
 END_of_HTML;
         $this->worksheetXml['xl/_rels/workbook.xml.rels'] = new \SimpleXMLElement($relsString);
 
-        $sharedString = <<< END_of_HTML
+        $sharedString = <<< 'END_of_HTML'
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>
 END_of_HTML;
