@@ -1,9 +1,9 @@
 <?php
 
-if (!function_exists('docs')) {
+if (! function_exists('docs')) {
     function docs(...$arguments)
     {
-        if (!isset($GLOBALS['DOC_GENERATOR'])) {
+        if (! isset($GLOBALS['DOC_GENERATOR'])) {
             return;
         }
 

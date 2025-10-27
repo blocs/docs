@@ -10,7 +10,9 @@ use Symfony\Component\HttpFoundation\Response;
 class Docs
 {
     private $keyword;
+
     private $neglect;
+
     private $comment;
 
     public function handle(Request $request, \Closure $next): Response
@@ -20,7 +22,7 @@ class Docs
 
         $response = $next($request);
 
-        if (!file_exists(base_path('docs/format.xlsx'))) {
+        if (! file_exists(base_path('docs/format.xlsx'))) {
             return $response;
         }
 
@@ -28,7 +30,7 @@ class Docs
         $currentRouteAction = ltrim(str_replace('\\', '/', Route::currentRouteAction()), '/');
         $currentRouteAction = str_replace('App/Http/Controllers/', '', $currentRouteAction);
         empty($currentRouteAction) && $currentRouteAction = 'class@method';
-        list($routeClass, $routeMethod) = explode('@', $currentRouteAction, 2);
+        [$routeClass, $routeMethod] = explode('@', $currentRouteAction, 2);
 
         // エクセルを準備
         $excelPath = base_path("docs/{$currentRouteAction}.xlsx");
@@ -47,15 +49,15 @@ class Docs
         if (count($steps)) {
             $endNo = count($steps) - 1;
 
-            if (!$steps[$endNo]['in'] && 200 === $response->getStatusCode() && is_object($response->original) && method_exists($response->original, 'getPath')) {
+            if (! $steps[$endNo]['in'] && $response->getStatusCode() === 200 && is_object($response->original) && method_exists($response->original, 'getPath')) {
                 // 画面表示の入力を記述
                 $viewPath = str_replace(resource_path('views/'), '', $response->original->getPath());
                 $viewPath && $steps[$endNo]['in'] = ['テンプレート' => '!'.$viewPath];
             }
 
-            if (!$steps[$endNo]['out']) {
+            if (! $steps[$endNo]['out']) {
                 // 画面表示の出力を記述
-                if (200 === $response->getStatusCode()) {
+                if ($response->getStatusCode() === 200) {
                     $contents = str_replace(["\r\n", "\r", "\n"], '', $response->getContent());
                     if (preg_match('/<title>(.*?)<\/title>/i', $contents, $match)) {
                         $steps[$endNo]['out'] = ['HTML' => '!'.trim($match[1])];
@@ -100,12 +102,12 @@ class Docs
         foreach ($step['in'] as $key => $items) {
             $excel->set(1, 'A', $line, $key);
             $excel->set(1, 'J', $line, '→');
-            ++$line;
+            $line++;
 
             is_array($items) || $items = array_filter([$items], 'strlen');
             foreach ($items as $item) {
                 $excel->set(1, 'B', $line, $this->replaceInOut($item));
-                ++$line;
+                $line++;
             }
         }
 
@@ -119,7 +121,7 @@ class Docs
             $process = array_shift($comments);
 
             // #から始まると見出し
-            $headline = !strncmp($process, '#', 1);
+            $headline = ! strncmp($process, '#', 1);
             $headline && $process = trim(substr($process, 1));
 
             $column = $headline ? 'K' : 'L';
@@ -127,14 +129,14 @@ class Docs
             if ($headline) {
                 // 見出し
                 $excel->set(1, $column, $line, $headlineNo.'. '.$process);
-                ++$headlineNo;
+                $headlineNo++;
                 $indentNo = 1;
             } else {
                 // インデント
                 $excel->set(1, $column, $line, $indentNo.') '.$process);
-                ++$indentNo;
+                $indentNo++;
             }
-            ++$line;
+            $line++;
 
             // 追加コメントを記述
             $column = $headline ? 'L' : 'M';
@@ -151,7 +153,7 @@ class Docs
 
             foreach ($comments as $comment) {
                 $excel->set(1, $column, $line, $this->replaceProcess($comment));
-                ++$line;
+                $line++;
             }
         }
 
@@ -159,7 +161,7 @@ class Docs
         $path = str_replace(base_path().'/', '', $step['path']);
         $column = $headline ? 'L' : 'M';
         $excel->set(1, $column, $line, $path.'@'.$step['function'].':'.$step['line']);
-        ++$line;
+        $line++;
 
         return ++$line;
     }
@@ -169,12 +171,12 @@ class Docs
         foreach ($step['out'] as $key => $items) {
             $excel->set(1, 'AO', $line, '→');
             $excel->set(1, 'AP', $line, $key);
-            ++$line;
+            $line++;
 
             is_array($items) || $items = array_filter([$items], 'strlen');
             foreach ($items as $item) {
                 $excel->set(1, 'AQ', $line, $this->replaceInOut($item));
-                ++$line;
+                $line++;
             }
         }
 
@@ -235,7 +237,7 @@ class Docs
 
     private function replaceInOut($item)
     {
-        if (!strncmp($item, '!', 1)) {
+        if (! strncmp($item, '!', 1)) {
             return substr($item, 1);
         }
 
@@ -244,7 +246,7 @@ class Docs
         array_multisort(array_map('strlen', $keywords), SORT_DESC, $keywords);
 
         foreach ($keywords as $key) {
-            if (false !== strpos($item, $key)) {
+            if (strpos($item, $key) !== false) {
                 // キーワード置き換え
                 $item = str_replace($key, $key.': '.$this->keyword[$key], $item);
 
@@ -257,7 +259,7 @@ class Docs
 
     private function replaceProcess($item)
     {
-        if (!strncmp($item, '!', 1)) {
+        if (! strncmp($item, '!', 1)) {
             return substr($item, 1);
         }
 
@@ -275,7 +277,7 @@ class Docs
         foreach ($this->neglect as $neglect) {
             $neglect = preg_replace("/\s/", '', $neglect);
 
-            if (false !== strpos($item, $neglect)) {
+            if (strpos($item, $neglect) !== false) {
                 return true;
             }
         }
@@ -290,7 +292,7 @@ class Docs
         foreach ($commentKeys as $commentKey) {
             $commentKey = preg_replace("/\s/", '', $commentKey);
 
-            if (false !== strpos($item, $commentKey)) {
+            if (strpos($item, $commentKey) !== false) {
                 return $this->comment[$commentKey];
             }
         }
