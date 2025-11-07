@@ -40,20 +40,20 @@ class Excel
      */
     public function get($sheetNo, $sheetColumn, $sheetRow, $formula = false)
     {
-        // 指定されたシートの読み込み
-        $sheetName = 'xl/worksheets/sheet'.$this->getSheetNo($sheetNo).'.xml';
-        $worksheetXml = $this->getWorksheetXml($sheetName);
+        // 指定されたシートを読み込み、XMLノードを取得する
+        $sheetName = 'xl/worksheets/sheet'.$this->resolveSheetIndex($sheetNo).'.xml';
+        $worksheetXml = $this->loadWorksheetXml($sheetName);
 
-        // 指定されたシートがない
+        // 指定されたシートが存在しない場合はそのまま終了する
         if ($worksheetXml === false) {
             return false;
         }
 
-        // 列番号、行番号を列名、行名に変換
-        [$columnName, $rowName] = $this->getName($sheetColumn, $sheetRow);
+        // 列番号・行番号をエクセル表記の列名・行名へ整形する
+        [$columnName, $rowName] = $this->normalizeCoordinate($sheetColumn, $sheetRow);
 
-        // 指定されたセルの値を取得
-        $value = $this->getValueSheet($worksheetXml, $columnName, $rowName, $formula);
+        // 指定されたセルの値または式を取得する
+        $value = $this->extractCellValue($worksheetXml, $columnName, $rowName, $formula);
 
         return $value;
     }
@@ -63,24 +63,24 @@ class Excel
      */
     public function all($sheetNo, $columns = [])
     {
-        // 指定されたシートの読み込み
-        $sheetName = 'xl/worksheets/sheet'.$this->getSheetNo($sheetNo).'.xml';
-        $worksheetXml = $this->getWorksheetXml($sheetName);
+        // 指定されたシートを読み込み、走査対象とする
+        $sheetName = 'xl/worksheets/sheet'.$this->resolveSheetIndex($sheetNo).'.xml';
+        $worksheetXml = $this->loadWorksheetXml($sheetName);
 
-        // 指定されたシートがない
+        // 指定されたシートが存在しない場合は空配列を返す
         if ($worksheetXml === false) {
             return false;
         }
 
-        // 全データを取得
+        // 全セルのデータを二次元配列として整形する
         $allData = [];
         $rows = $worksheetXml->sheetData->row;
         foreach ($rows as $row) {
             $rowData = [];
             $columnIndex = 0;
             foreach ($row->c as $cell) {
-                while ($this->getColumnName($columnIndex).$row['r'] != $cell['r']) {
-                    // 空白セルを追加
+                while ($this->resolveColumnName($columnIndex).$row['r'] != $cell['r']) {
+                    // 空白セルを補完して列順を揃える
                     if (empty($columns) || in_array($columnIndex, $columns)) {
                         $rowData[] = '';
                     }
@@ -88,9 +88,9 @@ class Excel
                 }
 
                 if ($cell['t'] == 's') {
-                    // 文字列の時
+                    // セルが文字列として保存されている場合
                     if (empty($columns) || in_array($columnIndex, $columns)) {
-                        $rowData[] = strval($this->getValue(intval($cell->v)));
+                        $rowData[] = strval($this->resolveSharedString(intval($cell->v)));
                     }
                 } else {
                     if (empty($columns) || in_array($columnIndex, $columns)) {
@@ -101,7 +101,7 @@ class Excel
             }
 
             while (count(array_keys($allData)) + 1 < $row['r']) {
-                // 空白行を追加
+                // 空白行を補完して行の欠損を防ぐ
                 if (isset($this->tempName)) {
                     file_put_contents($this->tempName, json_encode([])."\n", FILE_APPEND);
                 }
@@ -121,8 +121,8 @@ class Excel
 
     public function open($sheetNo, $columns = [])
     {
-        // テンポラリファイル作成
-        $this->tempName = $this->generateTempName();
+        // テンポラリファイルを作成してストリームを準備する
+        $this->tempName = $this->createTempFileName();
 
         $this->all($sheetNo, $columns);
 
@@ -151,19 +151,19 @@ class Excel
         fclose($this->fp);
         $this->fp = null;
 
-        // テンポラリファイル削除
+        // テンポラリファイルを削除してリソースを解放する
         is_file($this->tempName) && unlink($this->tempName);
         $this->tempName = null;
     }
 
     public function sheetNames()
     {
-        return array_keys($this->getSheetNo());
+        return array_keys($this->resolveSheetIndex());
     }
 
-    private function getWorksheetFile($sheetName)
+    private function loadWorksheetFile($sheetName)
     {
-        // シートがない時
+        // アーカイブ内に対象ファイルが存在しない場合
         if (empty($this->excelTemplate->numFiles)) {
             return false;
         }
@@ -173,8 +173,8 @@ class Excel
             return false;
         }
 
-        // テンポラリファイル作成
-        $tempName = $this->generateTempName();
+        // テンポラリファイルを生成して内容を一時保存する
+        $tempName = $this->createTempFileName();
 
         while (! feof($fp)) {
             file_put_contents($tempName, fread($fp, 1024 * 1024), FILE_APPEND);
@@ -184,21 +184,21 @@ class Excel
         return $tempName;
     }
 
-    private function getWorksheetXml($sheetName)
+    private function loadWorksheetXml($sheetName)
     {
         if (isset($this->worksheetXml[$sheetName])) {
-            // キャッシュを読み込み
+            // キャッシュ済みのXMLを再利用する
             return $this->worksheetXml[$sheetName];
         }
 
-        $tempName = $this->getWorksheetFile($sheetName);
+        $tempName = $this->loadWorksheetFile($sheetName);
 
-        // シートがない時
+        // アーカイブに対象ファイルが存在しない場合は失敗扱いにする
         if (! $tempName) {
             return false;
         }
 
-        // キャッシュを作成
+        // 読み込んだXMLをキャッシュへ保存する
         $this->worksheetXml[$sheetName] = simplexml_load_file($tempName);
 
         is_file($tempName) && unlink($tempName);
@@ -206,9 +206,26 @@ class Excel
         return $this->worksheetXml[$sheetName];
     }
 
-    private function getSheetNo($sheetName = null)
+    private function loadWorksheetString($sheetName)
     {
-        $worksheetXml = $this->getWorksheetXml('xl/workbook.xml');
+        // 指定ファイルを読み込み文字列として取得
+        $tempName = $this->loadWorksheetFile($sheetName);
+
+        // シートがない時
+        if (! $tempName) {
+            return '';
+        }
+
+        $content = file_get_contents($tempName);
+
+        is_file($tempName) && unlink($tempName);
+
+        return $content;
+    }
+
+    private function resolveSheetIndex($sheetName = null)
+    {
+        $worksheetXml = $this->loadWorksheetXml('xl/workbook.xml');
         $sheets = $worksheetXml->sheets[0]->sheet;
 
         $sheetNo = 0;
@@ -224,15 +241,15 @@ class Excel
         return isset($sheetNames[$sheetName]) ? $sheetNames[$sheetName] : $sheetName;
     }
 
-    private function getName($sheetColumn, $sheetRow)
+    private function normalizeCoordinate($sheetColumn, $sheetRow)
     {
-        is_int($sheetColumn) && $sheetColumn = $this->getColumnName($sheetColumn);
+        is_int($sheetColumn) && $sheetColumn = $this->resolveColumnName($sheetColumn);
         is_int($sheetRow) && $sheetRow = $sheetRow + 1;
 
         return [$sheetColumn, $sheetRow];
     }
 
-    private function getColumnName($columnIndex)
+    private function resolveColumnName($columnIndex)
     {
         $columnName = '';
         $currentColIndex = $columnIndex;
@@ -249,7 +266,7 @@ class Excel
         return $columnName;
     }
 
-    private function getValueSheet($worksheetXml, $columnName, $rowName, $formula = false)
+    private function extractCellValue($worksheetXml, $columnName, $rowName, $formula = false)
     {
         $cellName = $columnName.$rowName;
 
@@ -262,11 +279,11 @@ class Excel
             foreach ($row->c as $cell) {
                 if ($cell['r'] == $cellName) {
                     if ($cell['t'] == 's') {
-                        // 文字列の時
+                        // セルが共有文字列を参照している場合
                         if ($formula) {
-                            return strval($this->getValue(intval($cell->f)));
+                            return strval($this->resolveSharedString(intval($cell->f)));
                         } else {
-                            return strval($this->getValue(intval($cell->v)));
+                            return strval($this->resolveSharedString(intval($cell->v)));
                         }
                     } else {
                         if ($formula) {
@@ -282,31 +299,31 @@ class Excel
         return false;
     }
 
-    private function getValue($stringIndex)
+    private function resolveSharedString($stringIndex)
     {
-        // 文字列の共通ファイルの読み込み
-        $sharedXml = $this->getWorksheetXml($this->sharedName);
+        // 共有文字列XMLを読み込みインデックスを解決する
+        $sharedXml = $this->loadWorksheetXml($this->sharedName);
 
-        // 共通ファイルがない時
+        // 共有文字列のXMLが存在しない場合は解決不可とする
         if ($sharedXml === false) {
             return false;
         }
 
-        // 共通ファイルで文字列を検索すること
+        // 共有文字列一覧を走査して指定インデックスを探す
         $sharedIndex = 0;
         foreach ($sharedXml->si as $sharedSi) {
             if ($sharedIndex == $stringIndex) {
                 $string = '';
 
-                // 装飾されている文字列を取得
+                // 装飾付き文字列のテキストを結合する
                 foreach ($sharedSi->r as $sharedSiR) {
                     isset($sharedSiR->t) && $string .= strval($sharedSiR->t);
                 }
 
-                // 装飾されていない文字列を取得
+                // 装飾無しのテキストノードを結合する
                 isset($sharedSi->t) && $string .= strval($sharedSi->t);
 
-                // 制御文字を削除
+                // 制御文字を除去してプレーンテキストに整形する
                 $string = str_replace('_x000D_', '', $string);
 
                 return $string;
@@ -317,9 +334,9 @@ class Excel
         return false;
     }
 
-    private function generateTempName()
+    private function createTempFileName()
     {
-        // テンポラリファイル作成
+        // テンポラリファイルを生成してファイル名を取得する
         if (function_exists('config')) {
             return tempnam(config('view.compiled'), 'excel');
         }
