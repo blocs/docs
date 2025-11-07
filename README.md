@@ -1,6 +1,6 @@
 <div align="center"><img src="logo.svg" width="400" /></div>
 
-# Laravel document generator
+# Laravel Document Generator
 Laravelのドキュメント生成ツール
 
 [![Latest stable version](https://img.shields.io/packagist/v/blocs/docs)](https://packagist.org/packages/blocs/docs)
@@ -8,19 +8,19 @@ Laravelのドキュメント生成ツール
 [![GitHub code size](https://img.shields.io/github/languages/code-size/blocs/docs)](https://github.com/blocs/docs)
 [![GitHub license](https://img.shields.io/github/license/blocs/docs)](https://github.com/blocs/docs)
 [![Laravel awesome](https://img.shields.io/badge/Awesome-Laravel-green)](https://github.com/blocs/docs)
-[![Laravel version](https://img.shields.io/badge/laravel-%3E%3D7-green)](https://github.com/blocs/docs)
-[![PHP version](https://img.shields.io/badge/php-%3E%3D7.4-blue)](https://github.com/blocs/docs)
+[![Laravel version](https://img.shields.io/badge/laravel-%3E%3D10-green)](https://github.com/blocs/docs)
+[![PHP version](https://img.shields.io/badge/php-%3E%3D8.3-blue)](https://github.com/blocs/docs)
 
-# 概要
-Laravelのコントローラーに処理説明を書くだけで、Excelドキュメント（処理機能記述書）を生成するミドルウェア
+[**Website**](https://blocs.jp/)
+| [**iknow**](https://linear.iknow.dev/?category=2)
 
-# 導入方法
-composerで導入してください。
-
+## 導入方法
+1. PHP と Composer をセットアップ
+2. Composer で Laravel をインストール
 ```sh
-laravel-app % composer require blocs/docs
+composer require blocs/docs
 ```
-
-# 使い方
-1. [Qiita:【Laravel】ドキュメント生成ツールを作ってみた](https://qiita.com/hyada/items/c40ae6a8fc6fff05c243)
-2. [Qiita:【PHP】Excelを操作するライブラリを作ってみた](https://qiita.com/hyada/items/0651596ca0acfbb6ad1d)
+3. docsをコピー
+```sh
+cp -r vendor/blocs/docs/docs ./
+```
