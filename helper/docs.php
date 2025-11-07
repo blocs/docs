@@ -7,37 +7,48 @@ if (! function_exists('docs')) {
             return;
         }
 
-        if (count($arguments) > 2) {
-            $in = $arguments[0] ?? [];
-            $process = $arguments[1] ?? [];
-            $out = $arguments[2] ?? [];
-            $validate = $arguments[3] ?? [];
-        } elseif (count($arguments) > 1) {
-            $in = $arguments[0] ?? [];
-            $process = $arguments[1] ?? [];
-            $out = [];
-            $validate = [];
+        $argumentCount = count($arguments);
+
+        $inputDocs = [];
+        $processDocs = [];
+        $outputDocs = [];
+        $validationDocs = [];
+
+        if ($argumentCount > 2) {
+            $inputDocs = $arguments[0] ?? [];
+            $processDocs = $arguments[1] ?? [];
+            $outputDocs = $arguments[2] ?? [];
+            $validationDocs = $arguments[3] ?? [];
+        } elseif ($argumentCount > 1) {
+            $inputDocs = $arguments[0] ?? [];
+            $processDocs = $arguments[1] ?? [];
         } else {
-            $in = [];
-            $process = $arguments[0] ?? [];
-            $out = [];
-            $validate = [];
+            $processDocs = $arguments[0] ?? [];
         }
 
-        is_array($in) || $in = [$in => []];
-        is_array($process) || $process = [$process];
-        is_array($out) || $out = [$out => []];
-        is_array($validate) || $validate = [$validate => []];
+        $normalizeDocs = static function ($value, bool $associative) {
+            if (is_array($value)) {
+                return $value;
+            }
 
-        $backtrace = debug_backtrace();
+            return $associative ? [$value => []] : [$value];
+        };
+
+        $inputDocs = $normalizeDocs($inputDocs, true);
+        $processDocs = $normalizeDocs($processDocs, false);
+        $outputDocs = $normalizeDocs($outputDocs, true);
+        $validationDocs = $normalizeDocs($validationDocs, true);
+
+        $backtrace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
+
         $GLOBALS['DOC_GENERATOR'][] = [
             'path' => $backtrace[0]['file'],
             'function' => $backtrace[1]['function'],
             'line' => $backtrace[0]['line'],
-            'in' => $in,
-            'process' => $process,
-            'out' => $out,
-            'validate' => $validate,
+            'in' => $inputDocs,
+            'process' => $processDocs,
+            'out' => $outputDocs,
+            'validate' => $validationDocs,
         ];
     }
 }

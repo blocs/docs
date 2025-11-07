@@ -9,15 +9,15 @@ use Symfony\Component\HttpFoundation\Response;
 
 class Docs
 {
-    private $keyword;
+    private array $keywords = [];
 
-    private $neglect;
+    private array $neglectPatterns = [];
 
-    private $comment;
+    private array $commentMap = [];
 
     public function handle(Request $request, \Closure $next): Response
     {
-        // ドキュメントグローバル変数
+        // ドキュメント生成で利用するグローバル情報を初期化
         $GLOBALS['DOC_GENERATOR'] = [];
 
         $response = $next($request);
@@ -26,20 +26,20 @@ class Docs
             return $response;
         }
 
-        // コントローラー、メソッドを取得
+        // 現在のコントローラーとメソッドを判定
         $currentRouteAction = ltrim(str_replace('\\', '/', Route::currentRouteAction()), '/');
         $currentRouteAction = str_replace('App/Http/Controllers/', '', $currentRouteAction);
         empty($currentRouteAction) && $currentRouteAction = 'class@method';
         [$routeClass, $routeMethod] = explode('@', $currentRouteAction, 2);
 
-        // エクセルを準備
+        // ドキュメント用のエクセルファイルを準備
         $excelPath = base_path("docs/{$currentRouteAction}.xlsx");
         is_dir(dirname($excelPath)) || mkdir(dirname($excelPath), 0777, true);
         copy(base_path('docs/format.xlsx'), $excelPath);
         $excel = new Excel($excelPath);
 
-        // 設定読み込み
-        $this->readConfig($routeClass, $routeMethod, $excel);
+        // 設定ファイルを読み込み反映
+        $this->loadConfig($routeClass, $routeMethod, $excel);
 
         $startLine = 5;
         $headlineNo = 1;
@@ -50,13 +50,13 @@ class Docs
             $endNo = count($steps) - 1;
 
             if (! $steps[$endNo]['in'] && $response->getStatusCode() === 200 && is_object($response->original) && method_exists($response->original, 'getPath')) {
-                // 画面表示の入力を記述
+                // 画面描画の入力情報を補完
                 $viewPath = str_replace(resource_path('views/'), '', $response->original->getPath());
                 $viewPath && $steps[$endNo]['in'] = ['テンプレート' => '!'.$viewPath];
             }
 
             if (! $steps[$endNo]['out']) {
-                // 画面表示の出力を記述
+                // 画面描画の出力情報を補完
                 if ($response->getStatusCode() === 200) {
                     $contents = str_replace(["\r\n", "\r", "\n"], '', $response->getContent());
                     if (preg_match('/<title>(.*?)<\/title>/i', $contents, $match)) {
@@ -67,25 +67,25 @@ class Docs
         }
 
         foreach ($steps as $stepNo => $step) {
-            // 非表示行
+            // 非表示対象のステップを判定
             $stepProcess = implode('', $step['process']);
-            $stepProcess = $this->replaceProcess($stepProcess);
-            if ($this->checkNeglect($stepProcess)) {
+            $stepProcess = $this->normalizeProcessValue($stepProcess);
+            if ($this->shouldSkipStep($stepProcess)) {
                 continue;
             }
 
             $maxLine = $startLine;
 
-            // 入力を記述
-            $line = $this->writeIn($startLine, $step, $excel);
+            // 入力情報を記述
+            $line = $this->fillInputRows($startLine, $step, $excel);
             $line > $maxLine && $maxLine = $line;
 
-            // 処理機能を記述
-            $line = $this->writeProcess($startLine, $step, $excel, $headlineNo, $indentNo);
+            // 処理手順を記述
+            $line = $this->fillProcessRows($startLine, $step, $excel, $headlineNo, $indentNo);
             $line > $maxLine && $maxLine = $line;
 
-            // 出力を記述
-            $line = $this->writeOut($startLine, $step, $excel);
+            // 出力情報を記述
+            $line = $this->fillOutputRows($startLine, $step, $excel);
             $line > $maxLine && $maxLine = $line;
 
             // 開始行更新
@@ -97,7 +97,7 @@ class Docs
         return $response;
     }
 
-    private function writeIn($line, $step, $excel)
+    private function fillInputRows($line, $step, $excel)
     {
         foreach ($step['in'] as $key => $items) {
             $excel->set(1, 'A', $line, $key);
@@ -106,7 +106,7 @@ class Docs
 
             is_array($items) || $items = array_filter([$items], 'strlen');
             foreach ($items as $item) {
-                $excel->set(1, 'B', $line, $this->replaceInOut($item));
+                $excel->set(1, 'B', $line, $this->normalizeInOutValue($item));
                 $line++;
             }
         }
@@ -114,35 +114,38 @@ class Docs
         return ++$line;
     }
 
-    private function writeProcess($line, $step, $excel, &$headlineNo, &$indentNo)
+    private function fillProcessRows($line, $step, $excel, &$headlineNo, &$indentNo)
     {
+        $pathColumn = 'M';
+
         foreach ($step['process'] as $process) {
             $comments = explode("\n", $process);
             $process = array_shift($comments);
 
-            // #から始まると見出し
+            // 行頭が#のときは見出し扱い
             $headline = ! strncmp($process, '#', 1);
             $headline && $process = trim(substr($process, 1));
 
             $column = $headline ? 'K' : 'L';
-            $process = $this->replaceProcess($process);
+            $pathColumn = $headline ? 'L' : 'M';
+            $process = $this->normalizeProcessValue($process);
             if ($headline) {
-                // 見出し
+                // 見出し行を記述
                 $excel->set(1, $column, $line, $headlineNo.'. '.$process);
                 $headlineNo++;
                 $indentNo = 1;
             } else {
-                // インデント
+                // 見出し配下の処理を記述
                 $excel->set(1, $column, $line, $indentNo.') '.$process);
                 $indentNo++;
             }
             $line++;
 
-            // 追加コメントを記述
+            // 追加コメントを補完
             $column = $headline ? 'L' : 'M';
-            ($addComment = $this->checkComment($process)) && $comments = array_merge($comments, explode("\n", $addComment));
+            ($addComment = $this->findSupplementaryComment($process)) && $comments = array_merge($comments, explode("\n", $addComment));
 
-            // バリデーション
+            // バリデーション情報を整形
             count($step['validate']) && $comments[] .= '<入力値>: <条件>: <メッセージ>';
             foreach ($step['validate'] as $validate) {
                 $validateComment = '・'.$validate['name'];
@@ -152,21 +155,20 @@ class Docs
             }
 
             foreach ($comments as $comment) {
-                $excel->set(1, $column, $line, $this->replaceProcess($comment));
+                $excel->set(1, $column, $line, $this->normalizeProcessValue($comment));
                 $line++;
             }
         }
 
         // 処理の箇所を記述
         $path = str_replace(base_path().'/', '', $step['path']);
-        $column = $headline ? 'L' : 'M';
-        $excel->set(1, $column, $line, $path.'@'.$step['function'].':'.$step['line']);
+        $excel->set(1, $pathColumn, $line, $path.'@'.$step['function'].':'.$step['line']);
         $line++;
 
         return ++$line;
     }
 
-    private function writeOut($line, $step, $excel)
+    private function fillOutputRows($line, $step, $excel)
     {
         foreach ($step['out'] as $key => $items) {
             $excel->set(1, 'AO', $line, '→');
@@ -175,7 +177,7 @@ class Docs
 
             is_array($items) || $items = array_filter([$items], 'strlen');
             foreach ($items as $item) {
-                $excel->set(1, 'AQ', $line, $this->replaceInOut($item));
+                $excel->set(1, 'AQ', $line, $this->normalizeInOutValue($item));
                 $line++;
             }
         }
@@ -183,12 +185,12 @@ class Docs
         return ++$line;
     }
 
-    private function readConfig($routeClass, $routeMethod, $excel)
+    private function loadConfig($routeClass, $routeMethod, $excel)
     {
         $config = [];
-        $keyword = [];
-        $neglect = [];
-        $comment = [];
+        $keywords = [];
+        $neglectPatterns = [];
+        $commentMap = [];
 
         $excel->set(1, 'AU', '1', date('Y/m/d'));
         $excel->set(1, 'E', '2', $routeClass.'@'.$routeMethod);
@@ -196,37 +198,37 @@ class Docs
         if (file_exists(base_path('docs/common.php'))) {
             include base_path('docs/common.php');
 
-            $keyword = $config['keyword'] ?? [];
-            $neglect = $config['neglect'] ?? [];
-            $comment = $config['comment'] ?? [];
+            $keywords = $config['keyword'] ?? [];
+            $neglectPatterns = $config['neglect'] ?? [];
+            $commentMap = $config['comment'] ?? [];
         }
 
         if (file_exists(base_path('docs/'.$routeClass.'.php'))) {
             include base_path('docs/'.$routeClass.'.php');
 
-            // class、method概要を記述
+            // classとmethodの概要を記述
             isset($config['description']) && $excel->set(1, 'Z', '1', $config['description']);
             isset($config[$routeMethod]['description']) && $excel->set(1, 'Q', '2', $config[$routeMethod]['description']);
 
             // キーワードを取得
-            isset($config['keyword']) && $keyword = array_merge($keyword, $config['keyword']);
-            isset($config[$routeMethod]['keyword']) && $keyword = array_merge($keyword, $config[$routeMethod]['keyword']);
+            isset($config['keyword']) && $keywords = array_merge($keywords, $config['keyword']);
+            isset($config[$routeMethod]['keyword']) && $keywords = array_merge($keywords, $config[$routeMethod]['keyword']);
 
             // 非表示行を取得
-            isset($config['neglect']) && $neglect = array_merge($neglect, $config['neglect']);
-            isset($config[$routeMethod]['neglect']) && $neglect = array_merge($neglect, $config[$routeMethod]['neglect']);
+            isset($config['neglect']) && $neglectPatterns = array_merge($neglectPatterns, $config['neglect']);
+            isset($config[$routeMethod]['neglect']) && $neglectPatterns = array_merge($neglectPatterns, $config[$routeMethod]['neglect']);
 
             // 追加コメントを取得
-            isset($config['comment']) && $comment = $this->mergeArray($comment, $config['comment']);
-            isset($config[$routeMethod]['comment']) && $comment = $this->mergeArray($comment, $config[$routeMethod]['comment']);
+            isset($config['comment']) && $commentMap = $this->mergeConfig($commentMap, $config['comment']);
+            isset($config[$routeMethod]['comment']) && $commentMap = $this->mergeConfig($commentMap, $config[$routeMethod]['comment']);
         }
 
-        $this->keyword = $keyword;
-        $this->neglect = $neglect;
-        $this->comment = $comment;
+        $this->keywords = $keywords;
+        $this->neglectPatterns = $neglectPatterns;
+        $this->commentMap = $commentMap;
     }
 
-    private function mergeArray($before, $after)
+    private function mergeConfig(array $before, array $after): array
     {
         foreach ($after as $key => $value) {
             $before[$key] = $value;
@@ -235,20 +237,20 @@ class Docs
         return $before;
     }
 
-    private function replaceInOut($item)
+    private function normalizeInOutValue($item)
     {
         if (! strncmp($item, '!', 1)) {
             return substr($item, 1);
         }
 
         // キーワードを長い順にソート
-        $keywords = array_keys($this->keyword);
+        $keywords = array_keys($this->keywords);
         array_multisort(array_map('strlen', $keywords), SORT_DESC, $keywords);
 
         foreach ($keywords as $key) {
             if (strpos($item, $key) !== false) {
                 // キーワード置き換え
-                $item = str_replace($key, $key.': '.$this->keyword[$key], $item);
+                $item = str_replace($key, $key.': '.$this->keywords[$key], $item);
 
                 return $item;
             }
@@ -257,13 +259,13 @@ class Docs
         return $item;
     }
 
-    private function replaceProcess($item)
+    private function normalizeProcessValue($item)
     {
         if (! strncmp($item, '!', 1)) {
             return substr($item, 1);
         }
 
-        foreach ($this->keyword as $key => $value) {
+        foreach ($this->keywords as $key => $value) {
             // キーワード置き換え
             $item = str_replace('<'.$key.'>', '<'.$value.'>', $item);
         }
@@ -271,10 +273,10 @@ class Docs
         return $item;
     }
 
-    private function checkNeglect($item)
+    private function shouldSkipStep($item)
     {
         $item = preg_replace("/\s/", '', $item);
-        foreach ($this->neglect as $neglect) {
+        foreach ($this->neglectPatterns as $neglect) {
             $neglect = preg_replace("/\s/", '', $neglect);
 
             if (strpos($item, $neglect) !== false) {
@@ -285,15 +287,15 @@ class Docs
         return false;
     }
 
-    private function checkComment($item)
+    private function findSupplementaryComment($item)
     {
         $item = preg_replace("/\s/", '', $item);
-        $commentKeys = array_keys($this->comment);
+        $commentKeys = array_keys($this->commentMap);
         foreach ($commentKeys as $commentKey) {
             $commentKey = preg_replace("/\s/", '', $commentKey);
 
             if (strpos($item, $commentKey) !== false) {
-                return $this->comment[$commentKey];
+                return $this->commentMap[$commentKey];
             }
         }
 
