@@ -337,10 +337,6 @@ class Excel
     private function createTempFileName()
     {
         // テンポラリファイルを生成してファイル名を取得する
-        if (function_exists('config')) {
-            return tempnam(config('view.compiled'), 'excel');
-        }
-
-        return tempnam(sys_get_temp_dir(), 'excel');
+        return tempnam(config('view.compiled'), 'excel');
     }
 }
