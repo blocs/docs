@@ -92,11 +92,7 @@ trait ExcelSetTrait
         $excelTemplate = $this->excelTemplate;
 
         // テンポラリファイルを作成してZip書き込み用に確保する
-        if (function_exists('config')) {
-            $tempName = tempnam(config('view.compiled'), 'excel');
-        } else {
-            $tempName = tempnam(sys_get_temp_dir(), 'excel');
-        }
+        $tempName = tempnam(config('view.compiled'), 'excel');
 
         $generateName = $tempName.'.zip';
         $excelGenerate = new \ZipArchive;
