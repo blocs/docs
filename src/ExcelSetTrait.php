@@ -2,10 +2,6 @@
 
 namespace Blocs;
 
-/**
- * テンプレートとなるエクセルファイルをとり込んで値の編集ができる
- * グラフや計算処理はエクセルファイルで実行する前提
- */
 trait ExcelSetTrait
 {
     private $sharedStrings;
@@ -18,12 +14,6 @@ trait ExcelSetTrait
 
     private $pendingSheetNames = [];
 
-    /**
-     * @param  string  $sheetNo  シートの番号、左から1,2とカウント
-     * @param  string  $sheetColumn  編集するカラムの列番号、もしくは列名
-     * @param  string  $sheetRow  編集するカラムの行番号、もしくは行名
-     * @param  string  $value  値
-     */
     public function set($sheetNo, $sheetColumn, $sheetRow, $value)
     {
         // 指定されたシートを読み込み、編集対象を準備する
@@ -50,9 +40,6 @@ trait ExcelSetTrait
         return $this;
     }
 
-    /**
-     * エクセルファイルのExport
-     */
     public function download($filename = null)
     {
         isset($filename) || $filename = basename($this->excelName);
@@ -64,9 +51,6 @@ trait ExcelSetTrait
             ->header('Cache-Control', 'max-age=0');
     }
 
-    /**
-     * エクセルファイルの保存
-     */
     public function save($filename = null)
     {
         isset($filename) || $filename = basename($this->excelName);
@@ -74,9 +58,6 @@ trait ExcelSetTrait
         file_put_contents($filename, $this->generate()) && chmod($filename, 0666);
     }
 
-    /**
-     * エクセルファイルの生成
-     */
     public function generate()
     {
         // 指定されたセルに値をセットし、反映済みXMLをキャッシュする
