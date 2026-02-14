@@ -2,6 +2,8 @@
 
 namespace Blocs;
 
+use XMLReader;
+
 class Excel
 {
     use ExcelSetTrait;
@@ -14,9 +16,33 @@ class Excel
 
     private $sharedName = 'xl/sharedStrings.xml';
 
+    /** @var array<int, string> 共有文字列の読み取り用キャッシュ（Traitの$sharedStringsとは別） */
+    private $readSharedStringsCache = [];
+
+    private $readSharedStringsLoaded = false;
+
     private $fp;
 
     private $tempName;
+
+    private $streamReader;
+
+    private $streamColumns = [];
+
+    /** @var array<int, int> 列フィルタ用（array_flip 済み・O(1) 検索） */
+    private $streamColumnsSet = [];
+
+    private $streamWorksheetTempName;
+
+    private $streamPendingBlanks = 0;
+
+    private $streamPendingRow = null;
+
+    /** @var int ストリーム読み取り時の期待行番号（1始まり） */
+    private $streamExpectedRow = 1;
+
+    /** @var array<string, int>|null シート名から番号のキャッシュ（resolveSheetIndex用） */
+    private $resolvedSheetIndexCache = null;
 
     public function __construct($excelName)
     {
@@ -25,103 +51,116 @@ class Excel
         $this->excelTemplate->open($excelName);
     }
 
+    /**
+     * 指定シートの指定セルの値を取得する
+     *
+     * @param  int|string  $sheetNo  シート番号（1始まり）またはシート名
+     * @param  int|string  $sheetColumn  列番号（0始まり）または列名（'A'等）
+     * @param  int|string  $sheetRow  行番号
+     * @param  bool  $formula  trueの場合式を返す
+     * @return mixed セルの値、式、または見つからない場合はfalse
+     */
     public function get($sheetNo, $sheetColumn, $sheetRow, $formula = false)
     {
-        // 指定されたシートを読み込み、XMLノードを取得する
         $sheetName = 'xl/worksheets/sheet'.$this->resolveSheetIndex($sheetNo).'.xml';
-        $worksheetXml = $this->loadWorksheetXml($sheetName);
 
-        // 指定されたシートが存在しない場合はそのまま終了する
-        if ($worksheetXml === false) {
+        if (! $this->excelTemplate->statName($sheetName)) {
             return false;
         }
 
-        // 列番号・行番号をエクセル表記の列名・行名へ整形する
         [$columnName, $rowName] = $this->normalizeCoordinate($sheetColumn, $sheetRow);
+        $cellName = $columnName.$rowName;
 
-        // 指定されたセルの値または式を取得する
-        $value = $this->extractCellValue($worksheetXml, $columnName, $rowName, $formula);
-
-        return $value;
+        return $this->extractCellValueWithReader($sheetName, $cellName, $formula);
     }
 
+    /**
+     * 指定シートの全セルを二次元配列で取得する
+     *
+     * @param  int|string  $sheetNo  シート番号またはシート名
+     * @param  array<int>  $columns  取得する列インデックスの配列（空の場合は全列）
+     * @return array<int, array<int, mixed>>|false 二次元配列、失敗時はfalse
+     */
     public function all($sheetNo, $columns = [])
     {
-        // 指定されたシートを読み込み、走査対象とする
         $sheetName = 'xl/worksheets/sheet'.$this->resolveSheetIndex($sheetNo).'.xml';
-        $worksheetXml = $this->loadWorksheetXml($sheetName);
 
-        // 指定されたシートが存在しない場合は空配列を返す
-        if ($worksheetXml === false) {
+        if (! $this->excelTemplate->statName($sheetName)) {
             return false;
         }
 
-        // 全セルのデータを二次元配列として整形する
         $allData = [];
-        $rows = $worksheetXml->sheetData->row;
-        foreach ($rows as $row) {
-            $rowData = [];
-            $columnIndex = 0;
-            foreach ($row->c as $cell) {
-                while ($this->resolveColumnName($columnIndex).$row['r'] != $cell['r']) {
-                    // 空白セルを補完して列順を揃える
-                    if (empty($columns) || in_array($columnIndex, $columns)) {
-                        $rowData[] = '';
-                    }
-                    $columnIndex++;
-                }
-
-                if ($cell['t'] == 's') {
-                    // セルが文字列として保存されている場合
-                    if (empty($columns) || in_array($columnIndex, $columns)) {
-                        $rowData[] = strval($this->resolveSharedString(intval($cell->v)));
-                    }
-                } else {
-                    if (empty($columns) || in_array($columnIndex, $columns)) {
-                        $rowData[] = strval($cell->v);
-                    }
-                }
-                $columnIndex++;
-            }
-
-            while (count(array_keys($allData)) + 1 < $row['r']) {
-                // 空白行を補完して行の欠損を防ぐ
-                if (isset($this->tempName)) {
-                    file_put_contents($this->tempName, json_encode([])."\n", FILE_APPEND);
-                }
-                $allData[] = [];
-            }
-
-            if (isset($this->tempName)) {
-                file_put_contents($this->tempName, json_encode($rowData)."\n", FILE_APPEND);
-                $allData[] = [];
-            } else {
-                $allData[] = $rowData;
-            }
-        }
+        $this->streamWorksheet($sheetName, $columns, function ($rowData, $rowIndex) use (&$allData) {
+            $allData[] = $rowData;
+        });
 
         return $allData;
     }
 
-    public function open($sheetNo, $columns = [])
+    /**
+     * ストリーム読み取りを開始する（大量データ用・メモリ効率良好）
+     * 遅延評価：first() が呼ばれるまで行の処理は行わない
+     *
+     * @param  int|string  $sheetNo  シート番号またはシート名
+     * @param  array<int>  $columns  取得する列インデックスの配列
+     */
+    public function open($sheetNo, $columns = []): void
     {
-        // テンポラリファイルを作成してストリームを準備する
-        $this->tempName = $this->createTempFileName();
+        $sheetName = 'xl/worksheets/sheet'.$this->resolveSheetIndex($sheetNo).'.xml';
 
-        $this->all($sheetNo, $columns);
+        if (! $this->excelTemplate->statName($sheetName)) {
+            return;
+        }
 
-        is_file($this->tempName) && $this->fp = @fopen($this->tempName, 'r');
+        $pathHasHash = str_contains($this->excelName, '#');
+        $realPath = realpath($this->excelName) ?: $this->excelName;
+        $pathHasHash = $pathHasHash || ($realPath !== false && str_contains((string) $realPath, '#'));
+
+        $this->streamReader = new XMLReader;
+        $opened = false;
+
+        if (! $pathHasHash && $realPath !== false) {
+            $zipUri = 'zip://'.$realPath.'#'.$sheetName;
+            $opened = @$this->streamReader->open($zipUri);
+        }
+
+        if (! $opened) {
+            $tempName = $this->loadWorksheetFile($sheetName);
+            if (! $tempName || ! $this->streamReader->open($tempName)) {
+                $this->streamReader = null;
+                $tempName && is_file($tempName) && unlink($tempName);
+
+                return;
+            }
+            $this->streamWorksheetTempName = $tempName;
+        } else {
+            $this->streamWorksheetTempName = null;
+        }
+
+        $this->streamColumns = $columns;
+        $this->streamColumnsSet = empty($columns) ? [] : array_flip($columns);
+        $this->streamExpectedRow = 1;
     }
 
+    /**
+     * ストリームから1行を読み込んで返す
+     *
+     * @return array<int, mixed>|false 行データ、終端時はfalse
+     */
     public function first()
     {
+        if ($this->streamReader !== null) {
+            return $this->firstFromStreamReader();
+        }
+
         if (! $this->fp) {
             $this->close();
 
             return false;
         }
 
-        if (($buff = fgets($this->fp)) !== false) {
+        $buff = fgets($this->fp);
+        if ($buff !== false) {
             return json_decode($buff, true);
         }
 
@@ -130,24 +169,166 @@ class Excel
         return false;
     }
 
-    public function close()
+    private function firstFromStreamReader()
     {
-        fclose($this->fp);
-        $this->fp = null;
+        if (! $this->streamReader) {
+            $this->close();
 
-        // テンポラリファイルを削除してリソースを解放する
-        is_file($this->tempName) && unlink($this->tempName);
+            return false;
+        }
+
+        if ($this->streamPendingBlanks > 0) {
+            $this->streamPendingBlanks--;
+
+            return [];
+        }
+
+        if ($this->streamPendingRow !== null) {
+            $row = $this->streamPendingRow;
+            $this->streamPendingRow = null;
+
+            return $row;
+        }
+
+        while ($this->streamReader->read()) {
+            if ($this->streamReader->nodeType !== XMLReader::ELEMENT
+                || $this->streamReader->localName !== 'row') {
+                continue;
+            }
+
+            $rowRef = $this->streamReader->getAttribute('r');
+            $rowNum = $rowRef ? (int) $rowRef : $this->streamExpectedRow;
+
+            if ($this->streamExpectedRow < $rowNum) {
+                $this->streamPendingBlanks = $rowNum - $this->streamExpectedRow - 1;
+                $this->streamPendingRow = $this->parseStreamRow($this->streamReader->readInnerXml());
+                $this->streamExpectedRow = $rowNum + 1;
+                $this->streamReader->next();
+
+                return [];
+            }
+
+            $innerXml = $this->streamReader->readInnerXml();
+
+            $rowData = $this->parseStreamRow($innerXml);
+            $this->streamExpectedRow = $rowNum + 1;
+
+            return $rowData;
+        }
+
+        $this->close();
+
+        return false;
+    }
+
+    private function parseStreamRow(string $innerXml): array
+    {
+        $rowData = [];
+        $columnIndex = 0;
+
+        if ($innerXml === '') {
+            return [];
+        }
+
+        $cells = $this->parseRowCells($innerXml);
+        foreach ($cells as $cellRef => $cellValue) {
+            $cellCol = $this->columnNameToIndex($cellRef);
+
+            while ($columnIndex < $cellCol) {
+                if (empty($this->streamColumnsSet) || isset($this->streamColumnsSet[$columnIndex])) {
+                    $rowData[] = '';
+                }
+                $columnIndex++;
+            }
+
+            if (empty($this->streamColumnsSet) || isset($this->streamColumnsSet[$columnIndex])) {
+                $rowData[] = $cellValue;
+            }
+            $columnIndex++;
+        }
+
+        return $rowData;
+    }
+
+    /**
+     * ストリームを閉じ、テンポラリファイルを削除する
+     */
+    public function close(): void
+    {
+        if ($this->streamReader) {
+            $this->streamReader->close();
+            $this->streamReader = null;
+            if ($this->streamWorksheetTempName && is_file($this->streamWorksheetTempName)) {
+                unlink($this->streamWorksheetTempName);
+            }
+            $this->streamWorksheetTempName = null;
+            $this->streamPendingBlanks = 0;
+            $this->streamPendingRow = null;
+            $this->streamExpectedRow = 1;
+            $this->streamColumnsSet = [];
+        }
+
+        if ($this->fp) {
+            fclose($this->fp);
+            $this->fp = null;
+        }
+
+        if ($this->tempName && is_file($this->tempName)) {
+            unlink($this->tempName);
+        }
         $this->tempName = null;
     }
 
-    public function sheetNames()
+    /**
+     * シート名一覧を取得する
+     *
+     * @return array<int, string> シート名の配列
+     */
+    public function sheetNames(): array
     {
-        return array_keys($this->resolveSheetIndex());
+        $names = $this->resolveSheetIndex();
+
+        return $names ? array_keys($names) : [];
+    }
+
+    /**
+     * ワークシートXMLを読み込み（Trait用・従来のloadWorksheetXml互換）
+     */
+    private function loadWorksheetXml($sheetName)
+    {
+        if (isset($this->worksheetXml[$sheetName])) {
+            return $this->worksheetXml[$sheetName];
+        }
+
+        $tempName = $this->loadWorksheetFile($sheetName);
+        if (! $tempName) {
+            return false;
+        }
+
+        $this->worksheetXml[$sheetName] = simplexml_load_file($tempName);
+        is_file($tempName) && unlink($tempName);
+
+        return $this->worksheetXml[$sheetName];
+    }
+
+    /**
+     * ワークシートを文字列として読み込み（Trait用）
+     */
+    private function loadWorksheetString($sheetName): string
+    {
+        $tempName = $this->loadWorksheetFile($sheetName);
+        if (! $tempName) {
+            return '';
+        }
+
+        $content = file_get_contents($tempName);
+        is_file($tempName) && unlink($tempName);
+
+        return $content;
     }
 
     private function loadWorksheetFile($sheetName)
     {
-        // アーカイブ内に対象ファイルが存在しない場合
         if (empty($this->excelTemplate->numFiles)) {
             return false;
         }
@@ -157,72 +338,332 @@ class Excel
             return false;
         }
 
-        // テンポラリファイルを生成して内容を一時保存する
         $tempName = $this->createTempFileName();
-
-        while (! feof($fp)) {
-            file_put_contents($tempName, fread($fp, 1024 * 1024), FILE_APPEND);
-        }
+        stream_copy_to_stream($fp, fopen($tempName, 'w'));
         fclose($fp);
 
         return $tempName;
     }
 
-    private function loadWorksheetXml($sheetName)
+    /**
+     * XMLReaderでワークシートをストリーム解析し、行ごとにコールバックを実行する
+     */
+    private function streamWorksheet(string $sheetName, array $columns, callable $rowCallback, $tempFp = null): void
     {
-        if (isset($this->worksheetXml[$sheetName])) {
-            // キャッシュ済みのXMLを再利用する
-            return $this->worksheetXml[$sheetName];
+        $tempName = $this->loadWorksheetFile($sheetName);
+        if (! $tempName) {
+            return;
         }
 
-        $tempName = $this->loadWorksheetFile($sheetName);
+        $reader = new XMLReader;
+        $reader->open($tempName);
 
-        // アーカイブに対象ファイルが存在しない場合は失敗扱いにする
+        $columnsSet = empty($columns) ? [] : array_flip($columns);
+        $currentRow = 0;
+        $expectedRow = 1;
+        $rowData = [];
+        $columnIndex = 0;
+        $maxColumnIndex = 0;
+
+        while ($reader->read()) {
+            if ($reader->nodeType !== XMLReader::ELEMENT) {
+                continue;
+            }
+
+            if ($reader->localName === 'row') {
+                $rowRef = $reader->getAttribute('r');
+                $rowNum = $rowRef ? (int) $rowRef : $expectedRow;
+
+                // 空白行を補完
+                while ($expectedRow < $rowNum) {
+                    $rowCallback([], $expectedRow);
+                    $expectedRow++;
+                }
+
+                $currentRow = $rowNum;
+                $rowData = [];
+                $columnIndex = 0;
+                $innerXml = $reader->readInnerXml();
+
+                if ($innerXml !== '') {
+                    $cells = $this->parseRowCells($innerXml);
+                    foreach ($cells as $cellRef => $cellValue) {
+                        $cellCol = $this->columnNameToIndex($cellRef);
+                        $cellRow = (int) preg_replace('/[A-Z]+/', '', $cellRef);
+
+                        while ($columnIndex < $cellCol) {
+                            if (empty($columnsSet) || isset($columnsSet[$columnIndex])) {
+                                $rowData[] = '';
+                            }
+                            $columnIndex++;
+                        }
+
+                        if (empty($columnsSet) || isset($columnsSet[$columnIndex])) {
+                            $rowData[] = $cellValue;
+                        }
+                        $columnIndex++;
+                        $maxColumnIndex = max($maxColumnIndex, $columnIndex);
+                    }
+                }
+
+                $rowCallback($rowData, $currentRow);
+                $expectedRow = $currentRow + 1;
+            }
+        }
+
+        $reader->close();
+        is_file($tempName) && unlink($tempName);
+    }
+
+    /**
+     * 行のXMLからセル参照と値を抽出（共有文字列は解決済みで返す）
+     *
+     * @param  bool  $preferFormula  trueの場合、式があるセルは式を返す
+     */
+    private function parseRowCells(string $innerXml, bool $preferFormula = false): array
+    {
+        $cells = $this->parseRowCellsWithReader($innerXml, $preferFormula);
+        uksort($cells, fn ($a, $b) => $this->columnNameToIndex($a) <=> $this->columnNameToIndex($b));
+
+        return $cells;
+    }
+
+    private function parseRowCellsWithReader(string $innerXml, bool $preferFormula): array
+    {
+        $cells = [];
+        $subReader = new XMLReader;
+        $subReader->XML('<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$innerXml.'</row>');
+
+        while ($subReader->read()) {
+            if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'c') {
+                continue;
+            }
+
+            $ref = $subReader->getAttribute('r');
+            $type = $subReader->getAttribute('t');
+            $value = '';
+            $formula = null;
+
+            if (! $subReader->isEmptyElement) {
+                $depth = $subReader->depth;
+                while ($subReader->read()) {
+                    if ($subReader->depth <= $depth) {
+                        break;
+                    }
+                    if ($subReader->nodeType === XMLReader::ELEMENT) {
+                        if ($subReader->localName === 'v') {
+                            $subReader->read();
+                            $value = $subReader->value ?? '';
+                        } elseif ($subReader->localName === 'f') {
+                            $subReader->read();
+                            $formula = $subReader->value ?? '';
+                        } elseif ($subReader->localName === 'is') {
+                            $value = $this->extractInlineStringText($subReader->readInnerXml());
+                        }
+                    }
+                }
+            }
+
+            if ($ref === null) {
+                continue;
+            }
+
+            if ($type === 's') {
+                $resolved = $this->resolveSharedStringByIndex((int) $value);
+
+                $value = ($resolved !== false && $resolved !== '') ? $resolved : $value;
+            }
+
+            if ($preferFormula && $formula !== null && $formula !== '') {
+                $value = $formula;
+            }
+
+            $cells[$ref] = $value;
+        }
+
+        $subReader->close();
+
+        return $cells;
+    }
+
+    private function extractInlineStringText(string $isInner): string
+    {
+        $string = '';
+        if (preg_match_all('/<t[^>]*>([\s\S]*?)<\/t>/', $isInner, $m)) {
+            $string = implode('', $m[1]);
+        }
+
+        return str_replace('_x000D_', '', html_entity_decode($string, ENT_XML1, 'UTF-8'));
+    }
+
+    /**
+     * 指定セルの値をXMLReaderでストリーム取得
+     */
+    private function extractCellValueWithReader(string $sheetName, string $cellName, bool $formula)
+    {
+        $tempName = $this->loadWorksheetFile($sheetName);
         if (! $tempName) {
             return false;
         }
 
-        // 読み込んだXMLをキャッシュへ保存する
-        $this->worksheetXml[$sheetName] = simplexml_load_file($tempName);
+        $reader = new XMLReader;
+        $reader->open($tempName);
 
+        $targetRow = (int) preg_replace('/[A-Z]+/', '', $cellName);
+
+        while ($reader->read()) {
+            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
+                continue;
+            }
+
+            $rowRef = $reader->getAttribute('r');
+            $rowNum = $rowRef ? (int) $rowRef : 0;
+
+            if ($rowNum > $targetRow) {
+                break;
+            }
+
+            if ($rowNum !== $targetRow) {
+                continue;
+            }
+
+            $innerXml = $reader->readInnerXml();
+            $cells = $this->parseRowCells($innerXml, $formula);
+
+            if (isset($cells[$cellName])) {
+                $result = $cells[$cellName];
+                $reader->close();
+                is_file($tempName) && unlink($tempName);
+
+                return $result;
+            }
+
+            break;
+        }
+
+        $reader->close();
         is_file($tempName) && unlink($tempName);
 
-        return $this->worksheetXml[$sheetName];
+        return false;
     }
 
-    private function loadWorksheetString($sheetName)
+    private function resolveSharedStringByIndex(int $stringIndex)
     {
-        // 指定ファイルを読み込み文字列として取得
-        $tempName = $this->loadWorksheetFile($sheetName);
+        if (! $this->readSharedStringsLoaded) {
+            $this->loadSharedStringsArray();
+        }
 
-        // シートがない時
-        if (! $tempName) {
+        if (! isset($this->readSharedStringsCache[$stringIndex])) {
+            return false;
+        }
+
+        return $this->readSharedStringsCache[$stringIndex];
+    }
+
+    /**
+     * XMLReaderで共有文字列をストリーム読み込みし配列に格納
+     */
+    private function loadSharedStringsArray(): void
+    {
+        $this->readSharedStringsCache = [];
+        $this->readSharedStringsLoaded = true;
+
+        $fp = $this->excelTemplate->getStream($this->sharedName);
+        if (! $fp) {
+            return;
+        }
+
+        $tempName = $this->createTempFileName();
+        stream_copy_to_stream($fp, fopen($tempName, 'w'));
+        fclose($fp);
+
+        $reader = new XMLReader;
+        $reader->open($tempName);
+
+        while ($reader->read()) {
+            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'si') {
+                continue;
+            }
+
+            $string = $this->extractSharedStringItem($reader);
+            $this->readSharedStringsCache[] = $string;
+        }
+
+        $reader->close();
+        is_file($tempName) && unlink($tempName);
+    }
+
+    private function extractSharedStringItem(XMLReader $reader): string
+    {
+        $innerXml = $reader->readInnerXml();
+
+        if ($innerXml === '') {
             return '';
         }
 
-        $content = file_get_contents($tempName);
+        if (strpos($innerXml, '<r>') === false) {
+            if (preg_match('/<t[^>]*>([\s\S]*?)<\/t>/', $innerXml, $m)) {
+                return str_replace('_x000D_', '', html_entity_decode($m[1], ENT_XML1, 'UTF-8'));
+            }
 
-        is_file($tempName) && unlink($tempName);
+            return '';
+        }
 
-        return $content;
+        $dom = new \DOMDocument;
+        @$dom->loadXML('<si xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$innerXml.'</si>');
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main');
+        $tNodes = $xpath->query('//main:t');
+
+        $string = '';
+        foreach ($tNodes as $node) {
+            $string .= $node->textContent ?? '';
+        }
+
+        return str_replace('_x000D_', '', $string);
+    }
+
+    private function columnNameToIndex(string $cellRef): int
+    {
+        $colPart = preg_replace('/\d+/', '', $cellRef);
+        $index = 0;
+        $len = strlen($colPart);
+        for ($i = 0; $i < $len; $i++) {
+            $index = $index * 26 + (ord($colPart[$i]) - ord('A') + 1);
+        }
+
+        return $index - 1;
     }
 
     private function resolveSheetIndex($sheetName = null)
     {
-        $worksheetXml = $this->loadWorksheetXml('xl/workbook.xml');
-        $sheets = $worksheetXml->sheets[0]->sheet;
+        if ($this->resolvedSheetIndexCache !== null) {
+            return $sheetName === null ? $this->resolvedSheetIndexCache : ($this->resolvedSheetIndexCache[$sheetName] ?? $sheetName);
+        }
+
+        $workbookTemp = $this->loadWorksheetFile('xl/workbook.xml');
+        if (! $workbookTemp) {
+            return $sheetName === null ? [] : ($sheetName ?? 0);
+        }
+
+        $workbookXml = simplexml_load_file($workbookTemp);
+        is_file($workbookTemp) && unlink($workbookTemp);
+
+        if (! $workbookXml || ! isset($workbookXml->sheets[0]->sheet)) {
+            return $sheetName === null ? [] : $sheetName;
+        }
 
         $sheetNo = 0;
         $sheetNames = [];
-        foreach ($sheets as $sheet) {
-            $sheetNames[strval($sheet->attributes()->name)] = ++$sheetNo;
+        foreach ($workbookXml->sheets[0]->sheet as $sheet) {
+            $name = (string) $sheet->attributes()->name;
+            $sheetNames[$name] = ++$sheetNo;
         }
 
-        if (! isset($sheetName)) {
-            return $sheetNames;
-        }
+        $this->resolvedSheetIndexCache = $sheetNames;
+        $this->worksheetXml['xl/workbook.xml'] = $workbookXml;
 
-        return isset($sheetNames[$sheetName]) ? $sheetNames[$sheetName] : $sheetName;
+        return $sheetName === null ? $sheetNames : ($sheetNames[$sheetName] ?? $sheetName);
     }
 
     private function normalizeCoordinate($sheetColumn, $sheetRow)
@@ -230,10 +671,10 @@ class Excel
         is_int($sheetColumn) && $sheetColumn = $this->resolveColumnName($sheetColumn);
         is_int($sheetRow) && $sheetRow = $sheetRow + 1;
 
-        return [$sheetColumn, $sheetRow];
+        return [$sheetColumn, (string) $sheetRow];
     }
 
-    private function resolveColumnName($columnIndex)
+    private function resolveColumnName($columnIndex): string
     {
         $columnName = '';
         $currentColIndex = $columnIndex;
@@ -244,83 +685,14 @@ class Excel
             if ($currentColIndex < 26) {
                 break;
             }
-            $currentColIndex = intval(floor(($currentColIndex - 26) / 26));
+            $currentColIndex = (int) floor(($currentColIndex - 26) / 26);
         }
 
         return $columnName;
     }
 
-    private function extractCellValue($worksheetXml, $columnName, $rowName, $formula = false)
+    private function createTempFileName(): string
     {
-        $cellName = $columnName.$rowName;
-
-        $rows = $worksheetXml->sheetData->row;
-        foreach ($rows as $row) {
-            if ($row['r'] != $rowName) {
-                continue;
-            }
-
-            foreach ($row->c as $cell) {
-                if ($cell['r'] == $cellName) {
-                    if ($cell['t'] == 's') {
-                        // セルが共有文字列を参照している場合
-                        if ($formula) {
-                            return strval($this->resolveSharedString(intval($cell->f)));
-                        } else {
-                            return strval($this->resolveSharedString(intval($cell->v)));
-                        }
-                    } else {
-                        if ($formula) {
-                            return strval($cell->f);
-                        } else {
-                            return strval($cell->v);
-                        }
-                    }
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private function resolveSharedString($stringIndex)
-    {
-        // 共有文字列XMLを読み込みインデックスを解決する
-        $sharedXml = $this->loadWorksheetXml($this->sharedName);
-
-        // 共有文字列のXMLが存在しない場合は解決不可とする
-        if ($sharedXml === false) {
-            return false;
-        }
-
-        // 共有文字列一覧を走査して指定インデックスを探す
-        $sharedIndex = 0;
-        foreach ($sharedXml->si as $sharedSi) {
-            if ($sharedIndex == $stringIndex) {
-                $string = '';
-
-                // 装飾付き文字列のテキストを結合する
-                foreach ($sharedSi->r as $sharedSiR) {
-                    isset($sharedSiR->t) && $string .= strval($sharedSiR->t);
-                }
-
-                // 装飾無しのテキストノードを結合する
-                isset($sharedSi->t) && $string .= strval($sharedSi->t);
-
-                // 制御文字を除去してプレーンテキストに整形する
-                $string = str_replace('_x000D_', '', $string);
-
-                return $string;
-            }
-            $sharedIndex++;
-        }
-
-        return false;
-    }
-
-    private function createTempFileName()
-    {
-        // テンポラリファイルを生成してファイル名を取得する
-        return tempnam(config('view.compiled'), 'excel');
+        return tempnam(config('view.compiled') ?? sys_get_temp_dir(), 'excel');
     }
 }
