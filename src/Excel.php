@@ -474,8 +474,8 @@ class Excel
                 $value = ($resolved !== false && $resolved !== '') ? $resolved : $value;
             }
 
-            if ($preferFormula && $formula !== null && $formula !== '') {
-                $value = $formula;
+            if ($preferFormula) {
+                $value = ($formula !== null && $formula !== '') ? $formula : '';
             }
 
             $cells[$ref] = $value;
