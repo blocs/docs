@@ -474,6 +474,10 @@ class Excel
                 $value = ($resolved !== false && $resolved !== '') ? $resolved : $value;
             }
 
+            if ($type !== 's' && is_numeric($value)) {
+                $value = $this->normalizeNumericCellValue($value);
+            }
+
             if ($preferFormula) {
                 $value = ($formula !== null && $formula !== '') ? $formula : '';
             }
@@ -484,6 +488,16 @@ class Excel
         $subReader->close();
 
         return $cells;
+    }
+
+    private function normalizeNumericCellValue(string $value): string
+    {
+        if (! is_numeric($value)) {
+            return $value;
+        }
+        $f = round((float) $value, 15);
+
+        return rtrim(rtrim(number_format($f, 15, '.', ''), '0'), '.');
     }
 
     private function extractInlineStringText(string $isInner): string
