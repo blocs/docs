@@ -495,9 +495,9 @@ class Excel
         if (! is_numeric($value)) {
             return $value;
         }
-        $f = round((float) $value, 15);
+        $f = round((float) $value, 14);
 
-        return rtrim(rtrim(number_format($f, 15, '.', ''), '0'), '.');
+        return rtrim(rtrim(number_format($f, 14, '.', ''), '0'), '.');
     }
 
     private function extractInlineStringText(string $isInner): string
