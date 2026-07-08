@@ -458,8 +458,11 @@ class Excel
                             $subReader->read();
                             $value = $subReader->value ?? '';
                         } elseif ($subReader->localName === 'f') {
-                            $subReader->read();
-                            $formula = $subReader->value ?? '';
+                            // 自己終了の<f/>でread()すると直後の<v>要素を消費してしまうため空要素は読まない
+                            if (! $subReader->isEmptyElement) {
+                                $subReader->read();
+                                $formula = $subReader->value ?? '';
+                            }
                         } elseif ($subReader->localName === 'is') {
                             $value = $this->extractInlineStringText($subReader->readInnerXml());
                         }
