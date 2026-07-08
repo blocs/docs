@@ -44,6 +44,9 @@ class Excel
     /** @var array<string, int>|null シート名から番号のキャッシュ（resolveSheetIndex用） */
     private $resolvedSheetIndexCache = null;
 
+    /** @var array<string, array<string, array{master:string, formula:string}>> シート名→(si→master情報) */
+    private $sharedFormulaeCache = [];
+
     public function __construct($excelName)
     {
         $this->excelName = $excelName;
@@ -515,6 +518,10 @@ class Excel
      */
     private function extractCellValueWithReader(string $sheetName, string $cellName, bool $formula)
     {
+        if ($formula) {
+            return $this->extractCellFormula($sheetName, $cellName);
+        }
+
         $tempName = $this->loadWorksheetFile($sheetName);
         if (! $tempName) {
             return false;
@@ -542,7 +549,7 @@ class Excel
             }
 
             $innerXml = $reader->readInnerXml();
-            $cells = $this->parseRowCells($innerXml, $formula);
+            $cells = $this->parseRowCells($innerXml, false);
 
             if (isset($cells[$cellName])) {
                 $result = $cells[$cellName];
@@ -559,6 +566,353 @@ class Excel
         is_file($tempName) && unlink($tempName);
 
         return false;
+    }
+
+    /**
+     * 指定セルの数式をXMLReaderでストリーム取得し、共有数式(shared formula)の場合は展開する
+     *
+     * @return string|false 数式文字列（数式のないセルは空文字列）、セルが存在しない場合はfalse
+     */
+    private function extractCellFormula(string $sheetName, string $cellName)
+    {
+        $tempName = $this->loadWorksheetFile($sheetName);
+        if (! $tempName) {
+            return false;
+        }
+
+        $reader = new XMLReader;
+        $reader->open($tempName);
+
+        $targetRow = (int) preg_replace('/[A-Z]+/', '', $cellName);
+        $formulaInfo = null;
+
+        while ($reader->read()) {
+            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
+                continue;
+            }
+
+            $rowRef = $reader->getAttribute('r');
+            $rowNum = $rowRef ? (int) $rowRef : 0;
+
+            if ($rowNum > $targetRow) {
+                break;
+            }
+
+            if ($rowNum !== $targetRow) {
+                continue;
+            }
+
+            $innerXml = $reader->readInnerXml();
+            $formulaInfo = $this->parseCellFormula($innerXml, $cellName);
+
+            break;
+        }
+
+        $reader->close();
+        is_file($tempName) && unlink($tempName);
+
+        if ($formulaInfo === null) {
+            return false;
+        }
+
+        if ($formulaInfo['formula'] !== '') {
+            return $this->stripFormulaPrefix($formulaInfo['formula']);
+        }
+
+        if ($formulaInfo['shared']) {
+            return $this->expandSharedFormula($sheetName, $cellName, $formulaInfo['si']);
+        }
+
+        return '';
+    }
+
+    /**
+     * 行innerXmlから対象セルの<f>要素の情報を取得する
+     *
+     * @return array{formula:string, shared:bool, si:?string}|null 対象セルが存在しない場合はnull（<f>無しのセルはformula空文字列）
+     */
+    private function parseCellFormula(string $innerXml, string $cellName): ?array
+    {
+        if ($innerXml === '') {
+            return null;
+        }
+
+        $subReader = new XMLReader;
+        $subReader->XML('<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$innerXml.'</row>');
+
+        $result = null;
+
+        while ($subReader->read()) {
+            if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'c') {
+                continue;
+            }
+
+            if ($subReader->getAttribute('r') !== $cellName) {
+                continue;
+            }
+
+            $result = ['formula' => '', 'shared' => false, 'si' => null];
+
+            if ($subReader->isEmptyElement) {
+                break;
+            }
+
+            $depth = $subReader->depth;
+            while ($subReader->read()) {
+                if ($subReader->depth <= $depth) {
+                    break;
+                }
+
+                if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'f') {
+                    continue;
+                }
+
+                $type = $subReader->getAttribute('t');
+                $si = $subReader->getAttribute('si');
+                $isEmptyF = $subReader->isEmptyElement;
+
+                $formulaText = '';
+                if (! $isEmptyF) {
+                    $subReader->read();
+                    $formulaText = $subReader->value ?? '';
+                }
+
+                $result = [
+                    'formula' => $formulaText,
+                    'shared' => $type !== null && strtolower($type) === 'shared',
+                    'si' => $si,
+                ];
+            }
+
+            break;
+        }
+
+        $subReader->close();
+
+        return $result;
+    }
+
+    /**
+     * シート全体をスキャンし、共有数式(shared formula)のmaster情報を収集する（si => [master, formula]）
+     * 結果はシート単位でキャッシュし、2回目以降は再スキャンしない
+     *
+     * @return array<string, array{master:string, formula:string}>
+     */
+    private function buildSharedFormulaMap(string $sheetName): array
+    {
+        if (isset($this->sharedFormulaeCache[$sheetName])) {
+            return $this->sharedFormulaeCache[$sheetName];
+        }
+
+        $map = [];
+
+        $tempName = $this->loadWorksheetFile($sheetName);
+        if ($tempName) {
+            $reader = new XMLReader;
+            $reader->open($tempName);
+
+            while ($reader->read()) {
+                if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
+                    continue;
+                }
+
+                $innerXml = $reader->readInnerXml();
+                if ($innerXml === '') {
+                    continue;
+                }
+
+                $subReader = new XMLReader;
+                $subReader->XML('<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$innerXml.'</row>');
+
+                while ($subReader->read()) {
+                    if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'c') {
+                        continue;
+                    }
+
+                    $cellRef = $subReader->getAttribute('r');
+
+                    if ($subReader->isEmptyElement) {
+                        continue;
+                    }
+
+                    $depth = $subReader->depth;
+                    while ($subReader->read()) {
+                        if ($subReader->depth <= $depth) {
+                            break;
+                        }
+
+                        if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'f') {
+                            continue;
+                        }
+
+                        $type = $subReader->getAttribute('t');
+                        $si = $subReader->getAttribute('si');
+                        $isEmptyF = $subReader->isEmptyElement;
+
+                        $formulaText = '';
+                        if (! $isEmptyF) {
+                            $subReader->read();
+                            $formulaText = $subReader->value ?? '';
+                        }
+
+                        if ($cellRef !== null && $si !== null && $formulaText !== '' && $type !== null && strtolower($type) === 'shared') {
+                            $map[$si] = [
+                                'master' => $cellRef,
+                                'formula' => $this->stripFormulaPrefix($formulaText),
+                            ];
+                        }
+                    }
+                }
+
+                $subReader->close();
+            }
+
+            $reader->close();
+            is_file($tempName) && unlink($tempName);
+        }
+
+        $this->sharedFormulaeCache[$sheetName] = $map;
+
+        return $map;
+    }
+
+    /**
+     * 共有数式(shared formula)のfollowerセルをmaster数式から相対参照補正して展開する
+     */
+    private function expandSharedFormula(string $sheetName, string $cellName, ?string $si): string
+    {
+        if ($si === null) {
+            return '=';
+        }
+
+        $map = $this->sharedFormulaeCache[$sheetName] ?? $this->buildSharedFormulaMap($sheetName);
+
+        if (! isset($map[$si])) {
+            return '=';
+        }
+
+        [$masterColumn, $masterRow] = $this->splitCellReference($map[$si]['master']);
+        [$currentColumn, $currentRow] = $this->splitCellReference($cellName);
+
+        return $this->adjustFormulaReferences(
+            $map[$si]['formula'],
+            $currentColumn - $masterColumn,
+            $currentRow - $masterRow
+        );
+    }
+
+    private function stripFormulaPrefix(string $formula): string
+    {
+        return trim(str_replace(['_xlfn.', '_xlws.'], '', $formula));
+    }
+
+    private function adjustFormulaReferences(string $formula, int $columnOffset, int $rowOffset): string
+    {
+        if ($columnOffset === 0 && $rowOffset === 0) {
+            return $formula;
+        }
+
+        $parts = explode('"', $formula);
+        foreach ($parts as $index => &$part) {
+            if ($index % 2 !== 0) {
+                continue;
+            }
+
+            $part = preg_replace_callback(
+                '/(?:(\'[^\']+\'|[\w.\x{80}-\x{10FFFF}]+)!)?(?<![\w$.])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?::(\$?)([A-Za-z]{1,3})(\$?)(\d+))?(?![\w(])/u',
+                function (array $matches) use ($columnOffset, $rowOffset): string {
+                    $sheetPrefix = ! empty($matches[1]) ? $matches[1].'!' : '';
+                    $result = $sheetPrefix.$this->adjustCellReference(
+                        $matches[2],
+                        $matches[3],
+                        $matches[4],
+                        $matches[5],
+                        $columnOffset,
+                        $rowOffset
+                    );
+
+                    if (! empty($matches[6])) {
+                        $result .= ':'.$this->adjustCellReference(
+                            $matches[6],
+                            $matches[7],
+                            $matches[8],
+                            $matches[9],
+                            $columnOffset,
+                            $rowOffset
+                        );
+                    }
+
+                    return $result;
+                },
+                $part
+            ) ?? $part;
+        }
+        unset($part);
+
+        return implode('"', $parts);
+    }
+
+    private function adjustCellReference(
+        string $columnAbsolute,
+        string $column,
+        string $rowAbsolute,
+        string $row,
+        int $columnOffset,
+        int $rowOffset
+    ): string {
+        $columnIndex = $this->columnIndexFromString($column);
+        $rowIndex = (int) $row;
+
+        if ($columnAbsolute !== '$') {
+            $columnIndex += $columnOffset;
+        }
+        if ($rowAbsolute !== '$') {
+            $rowIndex += $rowOffset;
+        }
+
+        return ($columnAbsolute === '$' ? '$' : '')
+            .$this->stringFromColumnIndex($columnIndex)
+            .($rowAbsolute === '$' ? '$' : '')
+            .$rowIndex;
+    }
+
+    /**
+     * @return array{0: int, 1: int}
+     */
+    private function splitCellReference(string $cellReference): array
+    {
+        if (! preg_match('/^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/', $cellReference, $matches)) {
+            return [0, 0];
+        }
+
+        return [
+            $this->columnIndexFromString($matches[2]),
+            (int) $matches[4],
+        ];
+    }
+
+    private function columnIndexFromString(string $column): int
+    {
+        $column = strtoupper($column);
+        $index = 0;
+        $length = strlen($column);
+        for ($i = 0; $i < $length; $i++) {
+            $index = $index * 26 + (ord($column[$i]) - ord('A') + 1);
+        }
+
+        return $index;
+    }
+
+    private function stringFromColumnIndex(int $columnIndex): string
+    {
+        $columnName = '';
+        while ($columnIndex > 0) {
+            $modulo = ($columnIndex - 1) % 26;
+            $columnName = chr(65 + $modulo).$columnName;
+            $columnIndex = intdiv($columnIndex - $modulo, 26);
+        }
+
+        return $columnName;
     }
 
     private function resolveSharedStringByIndex(int $stringIndex)
