@@ -455,8 +455,10 @@ class Excel
                     }
                     if ($subReader->nodeType === XMLReader::ELEMENT) {
                         if ($subReader->localName === 'v') {
-                            $subReader->read();
-                            $value = $subReader->value ?? '';
+                            if (! $subReader->isEmptyElement) {
+                                $subReader->read();
+                                $value = $subReader->value ?? '';
+                            }
                         } elseif ($subReader->localName === 'f') {
                             // 自己終了の<f/>でread()すると直後の<v>要素を消費してしまうため空要素は読まない
                             if (! $subReader->isEmptyElement) {

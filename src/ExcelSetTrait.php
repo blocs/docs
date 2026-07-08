@@ -213,9 +213,22 @@ trait ExcelSetTrait
                 }
 
                 if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'sheetData' && $reader->namespaceURI === $ns) {
-                    $inSheetData = true;
+                    $isEmptySheetData = $reader->isEmptyElement;
                     $attrs = $this->readerAttributesToXml($reader);
                     fwrite($writer, '<sheetData'.$attrs.'>');
+
+                    if ($isEmptySheetData) {
+                        // 空要素はEND_ELEMENTイベントが発生しないため、ここで追加行を書き出して閉じる
+                        foreach (array_keys($targetRowNumbers) as $rKey) {
+                            if (isset($pendingValues[$rKey]) && ! empty($pendingValues[$rKey])) {
+                                fwrite($writer, $this->buildNewRowXml($rKey, $pendingValues[$rKey]));
+                            }
+                        }
+                        $targetRowNumbers = [];
+                        fwrite($writer, '</sheetData>');
+                    } else {
+                        $inSheetData = true;
+                    }
 
                     continue;
                 }
@@ -261,6 +274,13 @@ trait ExcelSetTrait
 
                 if (! $inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->depth >= 1) {
                     fwrite($writer, $reader->readOuterXml());
+
+                    // readOuterXml()はカーソルを進めないため、子要素が重複出力されないようサブツリー末尾まで読み飛ばす
+                    if (! $reader->isEmptyElement) {
+                        $skipDepth = $reader->depth;
+                        while ($reader->read() && ! ($reader->nodeType === XMLReader::END_ELEMENT && $reader->depth <= $skipDepth)) {
+                        }
+                    }
 
                     continue;
                 }
