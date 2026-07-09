@@ -47,6 +47,12 @@ class Excel
     /** @var array<string, array<string, array{master:string, formula:string}>> シート名→(si→master情報) */
     private $sharedFormulaeCache = [];
 
+    /** @var array<string, array<string, array{formula:string, shared:bool, si:?string}>> シート名→(cellRef→<f>情報) */
+    private $sheetFormulaCellsCache = [];
+
+    /** @var array<string, bool> シート名→数式キャッシュ構築済みフラグ */
+    private $sheetFormulaeLoaded = [];
+
     public function __construct($excelName)
     {
         $this->excelName = $excelName;
@@ -574,211 +580,153 @@ class Excel
     }
 
     /**
-     * 指定セルの数式をXMLReaderでストリーム取得し、共有数式(shared formula)の場合は展開する
+     * 指定セルの数式を、シート単位で1パース→配列キャッシュしたlookupから取得する。
+     * 共有数式(shared formula)のfollowerは初回アクセス時にmaster数式から展開する。
      *
      * @return string|false 数式文字列（数式のないセルは空文字列）、セルが存在しない場合はfalse
      */
     private function extractCellFormula(string $sheetName, string $cellName)
     {
-        $tempName = $this->loadWorksheetFile($sheetName);
-        if (! $tempName) {
-            return false;
-        }
+        $this->loadSheetFormulaeArray($sheetName);
 
-        $reader = new XMLReader;
-        $reader->open($tempName);
+        $info = $this->sheetFormulaCellsCache[$sheetName][$cellName] ?? null;
 
-        $targetRow = (int) preg_replace('/[A-Z]+/', '', $cellName);
-        $formulaInfo = null;
-
-        while ($reader->read()) {
-            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
-                continue;
+        if ($info !== null) {
+            if ($info['formula'] !== '') {
+                return $info['formula'];
+            }
+            if ($info['shared']) {
+                return $this->expandSharedFormula($sheetName, $cellName, $info['si']);
             }
 
-            $rowRef = $reader->getAttribute('r');
-            $rowNum = $rowRef ? (int) $rowRef : 0;
+            return '';
+        }
 
-            if ($rowNum > $targetRow) {
+        // <f> を持たないセル: 「セル存在→''」「不存在→false」の仕様を維持するため
+        // 既存の値取得スキャンで存在確認する（数式取得の典型ワークロードでは稀な経路）
+        return $this->extractCellValueWithReader($sheetName, $cellName, false) === false ? false : '';
+    }
+
+    /**
+     * ワークシートXMLを単一パスのXMLReaderで走査し、
+     * 「<f>を持つセルの情報」と「共有数式(shared formula)のsi→master情報」を同時に構築してキャッシュする。
+     * shared strings のキャッシュ構築（loadSharedStringsArray）と同じ「1パス→配列→O(1) lookup」方式。
+     */
+    private function loadSheetFormulaeArray(string $sheetName): void
+    {
+        if (! empty($this->sheetFormulaeLoaded[$sheetName])) {
+            return;
+        }
+        $this->sheetFormulaeLoaded[$sheetName] = true;
+        $this->sheetFormulaCellsCache[$sheetName] = [];
+        $this->sharedFormulaeCache[$sheetName] = [];
+
+        $opened = $this->openWorksheetReader($sheetName);
+        if ($opened === null) {
+            return;
+        }
+
+        [$reader, $tempName] = $opened;
+
+        $currentCell = null;
+        $inSheetData = false;
+
+        while ($reader->read()) {
+            // extLst内の<xm:f>（条件付き書式等）を誤って取り込まないよう、走査はsheetData内に限定する
+            if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'sheetData') {
                 break;
             }
 
-            if ($rowNum !== $targetRow) {
+            if ($reader->nodeType !== XMLReader::ELEMENT) {
                 continue;
             }
 
-            $innerXml = $reader->readInnerXml();
-            $formulaInfo = $this->parseCellFormula($innerXml, $cellName);
+            if ($reader->localName === 'sheetData') {
+                if ($reader->isEmptyElement) {
+                    break;
+                }
+                $inSheetData = true;
 
-            break;
+                continue;
+            }
+
+            if (! $inSheetData) {
+                continue;
+            }
+
+            if ($reader->localName === 'c') {
+                $currentCell = $reader->getAttribute('r');
+
+                continue;
+            }
+
+            if ($reader->localName !== 'f' || $currentCell === null) {
+                continue;
+            }
+
+            // <f> 要素: 属性は必ず要素位置で読む
+            $type = $reader->getAttribute('t');
+            $si = $reader->getAttribute('si');
+            $shared = $type !== null && strtolower($type) === 'shared';
+
+            $formulaText = '';
+            if (! $reader->isEmptyElement) {
+                // <f/>（自己終了）で read() すると次ノードを誤読するため空要素は読まない
+                $reader->read();
+                $formulaText = $reader->value ?? '';
+            }
+
+            $stripped = $formulaText === '' ? '' : $this->stripFormulaPrefix($formulaText);
+
+            $this->sheetFormulaCellsCache[$sheetName][$currentCell] = [
+                'formula' => $stripped,
+                'shared' => $shared,
+                'si' => $si,
+            ];
+
+            if ($shared && $si !== null && $stripped !== '') {
+                // master（本文あり shared）。si 重複時は現行実装と同じ後勝ちで上書き
+                $this->sharedFormulaeCache[$sheetName][$si] = [
+                    'master' => $currentCell,
+                    'formula' => $stripped,
+                ];
+            }
         }
 
         $reader->close();
-        is_file($tempName) && unlink($tempName);
-
-        if ($formulaInfo === null) {
-            return false;
-        }
-
-        if ($formulaInfo['formula'] !== '') {
-            return $this->stripFormulaPrefix($formulaInfo['formula']);
-        }
-
-        if ($formulaInfo['shared']) {
-            return $this->expandSharedFormula($sheetName, $cellName, $formulaInfo['si']);
-        }
-
-        return '';
+        $tempName && is_file($tempName) && unlink($tempName);
     }
 
     /**
-     * 行innerXmlから対象セルの<f>要素の情報を取得する
+     * ワークシートXML用のXMLReaderを開く。ファイルパスに'#'を含まない場合はzip://直接オープンで
+     * テンポラリファイルの書き出しを回避し、それ以外は従来通りloadWorksheetFile()を使う。
      *
-     * @return array{formula:string, shared:bool, si:?string}|null 対象セルが存在しない場合はnull（<f>無しのセルはformula空文字列）
+     * @return array{0: XMLReader, 1: ?string}|null [reader, 削除すべきtempファイル名|null]
      */
-    private function parseCellFormula(string $innerXml, string $cellName): ?array
+    private function openWorksheetReader(string $sheetName): ?array
     {
-        if ($innerXml === '') {
+        $realPath = realpath($this->excelName) ?: $this->excelName;
+        $pathHasHash = str_contains($this->excelName, '#') || str_contains((string) $realPath, '#');
+
+        if (! $pathHasHash && $realPath !== false) {
+            $reader = new XMLReader;
+            if (@$reader->open('zip://'.$realPath.'#'.$sheetName)) {
+                return [$reader, null];
+            }
+        }
+
+        $tempName = $this->loadWorksheetFile($sheetName);
+        if (! $tempName) {
+            return null;
+        }
+        $reader = new XMLReader;
+        if (! $reader->open($tempName)) {
+            is_file($tempName) && unlink($tempName);
+
             return null;
         }
 
-        $subReader = new XMLReader;
-        $subReader->XML('<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$innerXml.'</row>');
-
-        $result = null;
-
-        while ($subReader->read()) {
-            if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'c') {
-                continue;
-            }
-
-            if ($subReader->getAttribute('r') !== $cellName) {
-                continue;
-            }
-
-            $result = ['formula' => '', 'shared' => false, 'si' => null];
-
-            if ($subReader->isEmptyElement) {
-                break;
-            }
-
-            $depth = $subReader->depth;
-            while ($subReader->read()) {
-                if ($subReader->depth <= $depth) {
-                    break;
-                }
-
-                if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'f') {
-                    continue;
-                }
-
-                $type = $subReader->getAttribute('t');
-                $si = $subReader->getAttribute('si');
-                $isEmptyF = $subReader->isEmptyElement;
-
-                $formulaText = '';
-                if (! $isEmptyF) {
-                    $subReader->read();
-                    $formulaText = $subReader->value ?? '';
-                }
-
-                $result = [
-                    'formula' => $formulaText,
-                    'shared' => $type !== null && strtolower($type) === 'shared',
-                    'si' => $si,
-                ];
-            }
-
-            break;
-        }
-
-        $subReader->close();
-
-        return $result;
-    }
-
-    /**
-     * シート全体をスキャンし、共有数式(shared formula)のmaster情報を収集する（si => [master, formula]）
-     * 結果はシート単位でキャッシュし、2回目以降は再スキャンしない
-     *
-     * @return array<string, array{master:string, formula:string}>
-     */
-    private function buildSharedFormulaMap(string $sheetName): array
-    {
-        if (isset($this->sharedFormulaeCache[$sheetName])) {
-            return $this->sharedFormulaeCache[$sheetName];
-        }
-
-        $map = [];
-
-        $tempName = $this->loadWorksheetFile($sheetName);
-        if ($tempName) {
-            $reader = new XMLReader;
-            $reader->open($tempName);
-
-            while ($reader->read()) {
-                if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
-                    continue;
-                }
-
-                $innerXml = $reader->readInnerXml();
-                if ($innerXml === '') {
-                    continue;
-                }
-
-                $subReader = new XMLReader;
-                $subReader->XML('<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$innerXml.'</row>');
-
-                while ($subReader->read()) {
-                    if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'c') {
-                        continue;
-                    }
-
-                    $cellRef = $subReader->getAttribute('r');
-
-                    if ($subReader->isEmptyElement) {
-                        continue;
-                    }
-
-                    $depth = $subReader->depth;
-                    while ($subReader->read()) {
-                        if ($subReader->depth <= $depth) {
-                            break;
-                        }
-
-                        if ($subReader->nodeType !== XMLReader::ELEMENT || $subReader->localName !== 'f') {
-                            continue;
-                        }
-
-                        $type = $subReader->getAttribute('t');
-                        $si = $subReader->getAttribute('si');
-                        $isEmptyF = $subReader->isEmptyElement;
-
-                        $formulaText = '';
-                        if (! $isEmptyF) {
-                            $subReader->read();
-                            $formulaText = $subReader->value ?? '';
-                        }
-
-                        if ($cellRef !== null && $si !== null && $formulaText !== '' && $type !== null && strtolower($type) === 'shared') {
-                            $map[$si] = [
-                                'master' => $cellRef,
-                                'formula' => $this->stripFormulaPrefix($formulaText),
-                            ];
-                        }
-                    }
-                }
-
-                $subReader->close();
-            }
-
-            $reader->close();
-            is_file($tempName) && unlink($tempName);
-        }
-
-        $this->sharedFormulaeCache[$sheetName] = $map;
-
-        return $map;
+        return [$reader, $tempName];
     }
 
     /**
@@ -790,7 +738,7 @@ class Excel
             return '=';
         }
 
-        $map = $this->sharedFormulaeCache[$sheetName] ?? $this->buildSharedFormulaMap($sheetName);
+        $map = $this->sharedFormulaeCache[$sheetName] ?? [];
 
         if (! isset($map[$si])) {
             return '=';
