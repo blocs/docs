@@ -50,8 +50,11 @@ class Excel
     /** @var array<string, array<string, array{formula:string, shared:bool, si:?string}>> シート名→(cellRef→<f>情報) */
     private $sheetFormulaCellsCache = [];
 
-    /** @var array<string, bool> シート名→数式キャッシュ構築済みフラグ */
-    private $sheetFormulaeLoaded = [];
+    /** @var array<string, array<string, string>> シート名→(cellRef→解決済みの値) */
+    private $sheetValueCellsCache = [];
+
+    /** @var array<string, bool> シート名→セルキャッシュ（値・数式）構築済みフラグ */
+    private $sheetCellsLoaded = [];
 
     public function __construct($excelName)
     {
@@ -525,7 +528,9 @@ class Excel
     }
 
     /**
-     * 指定セルの値をXMLReaderでストリーム取得
+     * 指定セルの値を、シート単位で1パース→配列キャッシュしたlookupから取得する。
+     *
+     * @return string|false セルの値（数式・値のないセルは''）、セルが存在しない場合はfalse
      */
     private function extractCellValueWithReader(string $sheetName, string $cellName, bool $formula)
     {
@@ -533,50 +538,10 @@ class Excel
             return $this->extractCellFormula($sheetName, $cellName);
         }
 
-        $tempName = $this->loadWorksheetFile($sheetName);
-        if (! $tempName) {
-            return false;
-        }
+        $this->loadSheetCellsArray($sheetName);
 
-        $reader = new XMLReader;
-        $reader->open($tempName);
-
-        $targetRow = (int) preg_replace('/[A-Z]+/', '', $cellName);
-
-        while ($reader->read()) {
-            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
-                continue;
-            }
-
-            $rowRef = $reader->getAttribute('r');
-            $rowNum = $rowRef ? (int) $rowRef : 0;
-
-            if ($rowNum > $targetRow) {
-                break;
-            }
-
-            if ($rowNum !== $targetRow) {
-                continue;
-            }
-
-            $innerXml = $reader->readInnerXml();
-            $cells = $this->parseRowCells($innerXml, false);
-
-            if (isset($cells[$cellName])) {
-                $result = $cells[$cellName];
-                $reader->close();
-                is_file($tempName) && unlink($tempName);
-
-                return $result;
-            }
-
-            break;
-        }
-
-        $reader->close();
-        is_file($tempName) && unlink($tempName);
-
-        return false;
+        // 値''のセルは isset() で取得できるため false と区別できる（キャッシュにnullは入らない）
+        return $this->sheetValueCellsCache[$sheetName][$cellName] ?? false;
     }
 
     /**
@@ -587,7 +552,7 @@ class Excel
      */
     private function extractCellFormula(string $sheetName, string $cellName)
     {
-        $this->loadSheetFormulaeArray($sheetName);
+        $this->loadSheetCellsArray($sheetName);
 
         $info = $this->sheetFormulaCellsCache[$sheetName][$cellName] ?? null;
 
@@ -603,22 +568,28 @@ class Excel
         }
 
         // <f> を持たないセル: 「セル存在→''」「不存在→false」の仕様を維持するため
-        // 既存の値取得スキャンで存在確認する（数式取得の典型ワークロードでは稀な経路）
-        return $this->extractCellValueWithReader($sheetName, $cellName, false) === false ? false : '';
+        // 値キャッシュのisset()で存在確認する（loadSheetCellsArrayは上で呼び出し済みのため追加ロード不要）
+        return isset($this->sheetValueCellsCache[$sheetName][$cellName]) ? '' : false;
     }
 
     /**
      * ワークシートXMLを単一パスのXMLReaderで走査し、
-     * 「<f>を持つセルの情報」と「共有数式(shared formula)のsi→master情報」を同時に構築してキャッシュする。
+     * 「解決済みの値」「<f>を持つセルの情報」「共有数式(shared formula)のsi→master情報」を
+     * 同時に構築してキャッシュする。
      * shared strings のキャッシュ構築（loadSharedStringsArray）と同じ「1パス→配列→O(1) lookup」方式。
+     *
+     * メモリ方針: 値キャッシュはシートの全セル値を保持する。get()によるランダムアクセスが
+     * 前提のワークロード向け。全行を順に舐める用途は従来どおりall()/open()→first()
+     * （ストリーミング）を使う。キャッシュはExcelインスタンス単位。実案件規模（数万セル）で数MB程度。
      */
-    private function loadSheetFormulaeArray(string $sheetName): void
+    private function loadSheetCellsArray(string $sheetName): void
     {
-        if (! empty($this->sheetFormulaeLoaded[$sheetName])) {
+        if (! empty($this->sheetCellsLoaded[$sheetName])) {
             return;
         }
-        $this->sheetFormulaeLoaded[$sheetName] = true;
+        $this->sheetCellsLoaded[$sheetName] = true;
         $this->sheetFormulaCellsCache[$sheetName] = [];
+        $this->sheetValueCellsCache[$sheetName] = [];
         $this->sharedFormulaeCache[$sheetName] = [];
 
         $opened = $this->openWorksheetReader($sheetName);
@@ -629,11 +600,38 @@ class Excel
         [$reader, $tempName] = $opened;
 
         $currentCell = null;
+        $currentType = null;
+        $currentValue = '';
         $inSheetData = false;
+
+        // 直前の<c>を値解決して確定する（<v>/<is>は<c>より後に来るためペンディング方式で組み立てる）
+        $flush = function () use (&$currentCell, &$currentType, &$currentValue, $sheetName) {
+            if ($currentCell === null) {
+                return;
+            }
+
+            $value = $currentValue;
+
+            if ($currentType === 's') {
+                $resolved = $this->resolveSharedStringByIndex((int) $value);
+                $value = ($resolved !== false && $resolved !== '') ? $resolved : $value;
+            }
+
+            if ($currentType !== 's' && is_numeric($value)) {
+                $value = $this->normalizeNumericCellValue($value);
+            }
+
+            $this->sheetValueCellsCache[$sheetName][$currentCell] = $value;
+
+            $currentCell = null;
+            $currentType = null;
+            $currentValue = '';
+        };
 
         while ($reader->read()) {
             // extLst内の<xm:f>（条件付き書式等）を誤って取り込まないよう、走査はsheetData内に限定する
             if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'sheetData') {
+                $flush();
                 break;
             }
 
@@ -655,7 +653,43 @@ class Excel
             }
 
             if ($reader->localName === 'c') {
+                $flush();
+
+                // r属性がnullの場合は$currentCellもnullのまま（キャッシュ対象外。現行挙動と同じ）
                 $currentCell = $reader->getAttribute('r');
+                $currentType = $reader->getAttribute('t');
+                $currentValue = '';
+
+                if ($reader->isEmptyElement) {
+                    // 空要素<c r="X1"/>はその場で''確定
+                    $flush();
+                }
+
+                continue;
+            }
+
+            if ($reader->localName === 'v') {
+                if ($currentCell === null) {
+                    continue;
+                }
+
+                // 自己終了<v/>でread()すると次ノードを誤読するため空要素は読まない
+                if (! $reader->isEmptyElement) {
+                    $reader->read();
+                    $currentValue = $reader->value ?? '';
+                }
+
+                continue;
+            }
+
+            if ($reader->localName === 'is') {
+                if ($currentCell === null) {
+                    continue;
+                }
+
+                // readInnerXml()はカーソルを進めないため、後続read()で<is>内の<t>を訪問するが
+                // tに対するハンドラは無いので無害
+                $currentValue = $this->extractInlineStringText($reader->readInnerXml());
 
                 continue;
             }
