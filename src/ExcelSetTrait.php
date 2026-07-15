@@ -6,7 +6,10 @@ use XMLReader;
 
 trait ExcelSetTrait
 {
-    private $sharedStrings;
+    private $sharedStringsLoaded = false;
+
+    /** @var int 共有文字列の総数（次に採番するインデックス） */
+    private $sharedStringsCount = 0;
 
     /** @var array<string, int> 共有文字列の値からインデックスマップ（O(1)ルックアップ用） */
     private $sharedStringsMap = [];
@@ -19,15 +22,11 @@ trait ExcelSetTrait
 
     private $pendingSheetNames = [];
 
-    /** @var array<string, string> ストリーミング書き込み時のワークシートテンポラリパス（generate後のクリーンアップ用） */
-    private $worksheetTempPaths = [];
-
     public function set($sheetNo, $sheetColumn, $sheetRow, $value)
     {
-        $sheetName = 'xl/worksheets/sheet'.$this->resolveSheetIndex($sheetNo).'.xml';
-
-        // 指定されたシートが存在しない場合は設定しない（メモリを使わずstatNameのみでチェック）
-        if (! $this->excelTemplate->statName($sheetName)) {
+        // 指定されたシートが存在しない場合は設定しない
+        $sheetName = $this->findWorksheet($sheetNo);
+        if ($sheetName === false) {
             return false;
         }
 
@@ -41,7 +40,9 @@ trait ExcelSetTrait
 
     public function name($sheetNo, $newSheetName)
     {
-        $this->pendingSheetNames[$sheetNo] = $newSheetName;
+        // シート番号（1始まり）またはシート名を位置に解決する
+        $position = $this->resolveSheetPosition($sheetNo);
+        $position === false || $this->pendingSheetNames[$position] = $newSheetName;
 
         return $this;
     }
@@ -66,12 +67,15 @@ trait ExcelSetTrait
 
     public function generate()
     {
+        if (! $this->templateLoaded) {
+            return false;
+        }
+
         // ストリーミング処理で変更行のみ編集（メモリ効率を重視）
         foreach ($this->pendingCellValues as $sheetName => $sheetValues) {
-            $result = $this->streamApplyValuesToSheet($sheetName, $sheetValues);
-            if ($result !== null) {
-                $this->worksheetXml[$sheetName] = $result;
-                $this->worksheetTempPaths[$sheetName] = $result['path'];
+            $modifiedPath = $this->streamApplyValuesToSheet($sheetName, $sheetValues);
+            if ($modifiedPath !== null) {
+                $this->worksheetXml[$sheetName] = $modifiedPath;
             }
         }
 
@@ -81,7 +85,7 @@ trait ExcelSetTrait
         $excelTemplate = $this->excelTemplate;
 
         // テンポラリファイルを作成してZip書き込み用に確保する
-        $tempName = tempnam(config('view.compiled') ?? sys_get_temp_dir(), 'excel');
+        $tempName = $this->createTempFileName();
 
         $generateName = $tempName.'.zip';
         $excelGenerate = new \ZipArchive;
@@ -92,35 +96,16 @@ trait ExcelSetTrait
             $worksheetString = $excelTemplate->getFromIndex($i);
 
             if ($sheetName == 'xl/workbook.xml') {
-                $worksheetXml = $this->loadWorksheetXml($sheetName);
-
-                // シート名を変更する指定がある場合は反映する
-                foreach ($this->pendingSheetNames as $sheetNo => $newSheetName) {
-                    if (isset($worksheetXml->sheets[0]->sheet[$sheetNo - 1])) {
-                        $worksheetXml->sheets[0]->sheet[$sheetNo - 1]['name'] = $newSheetName;
-                        $worksheetString = $worksheetXml->asXML();
-                    }
-                }
-
-                if (isset($worksheetXml->calcPr['forceFullCalc'])) {
-                    // テンプレートそのままのシートはそのまま書き戻す
-                    $excelGenerate->addFromString($sheetName, $worksheetString);
-
-                    continue;
-                }
-
-                // 強制的に計算させる設定を付与してから書き戻す
-                $worksheetXml->calcPr->addAttribute('forceFullCalc', 1);
-                $excelGenerate->addFromString($sheetName, $worksheetXml->asXML());
+                $excelGenerate->addFromString($sheetName, $this->buildWorkbookXml($worksheetString));
 
                 continue;
             }
 
             if (isset($this->worksheetXml[$sheetName])) {
-                // 値を差し替えたシート：ストリーミングの場合はaddFileでメモリ節約
+                // 値を差し替えたシート：ストリーミング編集済みのテンポラリはaddFileでメモリ節約
                 $entry = $this->worksheetXml[$sheetName];
-                if (is_array($entry) && isset($entry['path']) && is_file($entry['path'])) {
-                    $excelGenerate->addFile($entry['path'], $sheetName);
+                if (is_string($entry)) {
+                    $excelGenerate->addFile($entry, $sheetName);
                 } else {
                     $excelGenerate->addFromString($sheetName, $entry->asXML());
                 }
@@ -133,7 +118,7 @@ trait ExcelSetTrait
         }
 
         if ($this->shouldAddSharedStrings) {
-            // 共通文字列のシートを追加して共有文字列を反映する
+            // 共有文字列のシートを追加して共有文字列を反映する
             $excelGenerate->addFromString($this->sharedName, $this->worksheetXml[$this->sharedName]->asXML());
         }
 
@@ -144,13 +129,43 @@ trait ExcelSetTrait
         is_file($generateName) && unlink($generateName);
         is_file($tempName) && unlink($tempName);
 
-        // ストリーミング用ワークシートテンポラリのクリーンアップ
-        foreach ($this->worksheetTempPaths as $path) {
-            is_file($path) && unlink($path);
+        // ストリーミング編集済みワークシートのテンポラリをクリーンアップ
+        foreach ($this->worksheetXml as $sheetName => $entry) {
+            if (is_string($entry)) {
+                is_file($entry) && unlink($entry);
+                unset($this->worksheetXml[$sheetName]);
+            }
         }
-        $this->worksheetTempPaths = [];
 
         return $excelGenerated;
+    }
+
+    /**
+     * workbook.xmlへシート名変更と強制再計算設定を反映した文字列を返す
+     */
+    private function buildWorkbookXml(string $workbookString): string
+    {
+        $workbookXml = $this->loadWorksheetXml('xl/workbook.xml');
+        if ($workbookXml === false) {
+            return $workbookString;
+        }
+
+        // シート名を変更する指定がある場合は反映する
+        $modified = false;
+        foreach ($this->pendingSheetNames as $sheetNo => $newSheetName) {
+            if (isset($workbookXml->sheets[0]->sheet[$sheetNo - 1])) {
+                $workbookXml->sheets[0]->sheet[$sheetNo - 1]['name'] = $newSheetName;
+                $modified = true;
+            }
+        }
+
+        // 開いたときに強制的に再計算させる設定を付与する（calcPrがないファイルはそのまま）
+        if (isset($workbookXml->calcPr) && ! isset($workbookXml->calcPr['forceFullCalc'])) {
+            $workbookXml->calcPr->addAttribute('forceFullCalc', 1);
+            $modified = true;
+        }
+
+        return $modified ? $workbookXml->asXML() : $workbookString;
     }
 
     /**
@@ -158,9 +173,9 @@ trait ExcelSetTrait
      * 変更のない行は生XMLをそのままコピーし、メモリ消費を1行分のDOM程度に抑える
      *
      * @param  array<string, array<string, mixed>>  $pendingValues  行名 => [セル名 => 値]
-     * @return array{path: string}|null 編集済みテンポラリパス、失敗時はnull
+     * @return string|null 編集済みテンポラリファイルのパス、失敗時はnull
      */
-    private function streamApplyValuesToSheet(string $sheetName, array $pendingValues): ?array
+    private function streamApplyValuesToSheet(string $sheetName, array $pendingValues): ?string
     {
         [$sourceUri, $tempToCleanup] = $this->getWorksheetSourceUri($sheetName);
         if ($sourceUri === '') {
@@ -180,14 +195,11 @@ trait ExcelSetTrait
         try {
             $reader = new XMLReader;
             if (! $reader->open($sourceUri)) {
-                fclose($writer);
                 is_file($outPath) && unlink($outPath);
-                $tempToCleanup && is_file($tempToCleanup) && unlink($tempToCleanup);
 
                 return null;
             }
 
-            $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
             $inSheetData = false;
             $expectedRow = 1;
 
@@ -198,10 +210,8 @@ trait ExcelSetTrait
                     continue;
                 }
 
-                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'worksheet' && $reader->namespaceURI === $ns) {
-                    $tagName = $reader->name;
-                    $attrs = $this->readerAttributesToXml($reader);
-                    fwrite($writer, '<'.$tagName.$attrs.'>');
+                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'worksheet' && $reader->namespaceURI === self::MAIN_NS) {
+                    fwrite($writer, '<'.$reader->name.$this->readerAttributesToXml($reader).'>');
 
                     continue;
                 }
@@ -212,19 +222,13 @@ trait ExcelSetTrait
                     continue;
                 }
 
-                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'sheetData' && $reader->namespaceURI === $ns) {
-                    $isEmptySheetData = $reader->isEmptyElement;
-                    $attrs = $this->readerAttributesToXml($reader);
-                    fwrite($writer, '<sheetData'.$attrs.'>');
+                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'sheetData' && $reader->namespaceURI === self::MAIN_NS) {
+                    fwrite($writer, '<sheetData'.$this->readerAttributesToXml($reader).'>');
 
-                    if ($isEmptySheetData) {
-                        // 空要素はEND_ELEMENTイベントが発生しないため、ここで追加行を書き出して閉じる
-                        // set() 呼び出し順ではなく行番号昇順で書き、Excel の修復ダイアログを防ぐ
-                        foreach ($this->sortedPendingRowKeys($targetRowNumbers) as $rKey) {
-                            if (isset($pendingValues[$rKey]) && ! empty($pendingValues[$rKey])) {
-                                fwrite($writer, $this->buildNewRowXml($rKey, $pendingValues[$rKey]));
-                            }
-                        }
+                    if ($reader->isEmptyElement) {
+                        // 空シートの<sheetData/>（自己終了タグ）はEND_ELEMENTが来ないため、
+                        // ここで追記行をすべて書き出して閉じる
+                        $this->writePendingRows($writer, $pendingValues, array_keys($targetRowNumbers));
                         $targetRowNumbers = [];
                         fwrite($writer, '</sheetData>');
                     } else {
@@ -234,55 +238,42 @@ trait ExcelSetTrait
                     continue;
                 }
 
-                if ($inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'row' && $reader->namespaceURI === $ns) {
+                if ($inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'row' && $reader->namespaceURI === self::MAIN_NS) {
                     $rowRef = $reader->getAttribute('r');
                     $rowNum = $rowRef ? (int) $rowRef : $expectedRow;
 
+                    // 既存行の手前に挿入する追記行を書き出す
                     for ($r = $expectedRow; $r < $rowNum; $r++) {
-                        $rKey = (string) $r;
-                        if (isset($pendingValues[$rKey]) && ! empty($pendingValues[$rKey])) {
-                            fwrite($writer, $this->buildNewRowXml($rKey, $pendingValues[$rKey]));
+                        if (! empty($pendingValues[(string) $r])) {
+                            fwrite($writer, $this->buildNewRowXml((string) $r, $pendingValues[(string) $r]));
                         }
                     }
                     $expectedRow = $rowNum + 1;
 
-                    $rowXml = $reader->readOuterXml();
-
                     if (isset($targetRowNumbers[(string) $rowNum])) {
-                        $modifiedRow = $this->applyValuesToRowXml($rowXml, (string) $rowNum, $pendingValues[$rowNum] ?? []);
-                        fwrite($writer, $modifiedRow);
+                        fwrite($writer, $this->applyValuesToRowXml($reader->readOuterXml(), (string) $rowNum, $pendingValues[$rowNum] ?? []));
                         unset($targetRowNumbers[(string) $rowNum]);
                     } else {
-                        fwrite($writer, $rowXml);
+                        fwrite($writer, $reader->readOuterXml());
                     }
 
                     continue;
                 }
 
                 if ($inSheetData && $reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'sheetData') {
-                    $lastRowNum = $expectedRow - 1;
-                    // 末尾追記も行番号昇順（set順だとヘッダーより下の行が先に来るケースがある）
-                    foreach ($this->sortedPendingRowKeys($targetRowNumbers) as $rKey) {
-                        $r = (int) $rKey;
-                        if ($r > $lastRowNum && isset($pendingValues[$rKey]) && ! empty($pendingValues[$rKey])) {
-                            fwrite($writer, $this->buildNewRowXml($rKey, $pendingValues[$rKey]));
-                        }
-                    }
+                    // 最終行より後ろの追記行を書き出す
+                    $this->writePendingRows($writer, $pendingValues, array_keys($targetRowNumbers), $expectedRow - 1);
                     fwrite($writer, '</sheetData>');
                     $inSheetData = false;
 
                     continue;
                 }
 
-                if (! $inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->depth >= 1) {
+                // sheetData外の要素はworksheet直下（depth 1）のみ丸ごとコピーする。
+                // readOuterXml()はリーダーを進めないため、depth 2以下も対象にすると
+                // 直後のread()で子要素に降りて同じ内容が重複して書き出されてしまう
+                if (! $inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->depth === 1) {
                     fwrite($writer, $reader->readOuterXml());
-
-                    // readOuterXml()はカーソルを進めないため、子要素が重複出力されないようサブツリー末尾まで読み飛ばす
-                    if (! $reader->isEmptyElement) {
-                        $skipDepth = $reader->depth;
-                        while ($reader->read() && ! ($reader->nodeType === XMLReader::END_ELEMENT && $reader->depth <= $skipDepth)) {
-                        }
-                    }
 
                     continue;
                 }
@@ -296,35 +287,26 @@ trait ExcelSetTrait
             }
         }
 
-        return ['path' => $outPath];
+        return $outPath;
     }
 
     /**
-     * ワークシートの読み取り元URIを取得（zip://直接参照を優先、フォールバックでテンポラリ抽出）
+     * まだ書き出していない追記行を行番号の昇順で書き出す
      *
-     * @return array{0: string, 1: string|null} [sourceUri, tempPathToCleanup]
+     * @param  resource  $writer
+     * @param  array<int, int|string>  $rowKeys  書き出し対象の行番号
+     * @param  int  $afterRow  この行番号より後の行のみ書き出す
      */
-    private function getWorksheetSourceUri(string $sheetName): array
+    private function writePendingRows($writer, array $pendingValues, array $rowKeys, int $afterRow = 0): void
     {
-        $realPath = realpath($this->excelName);
-        $pathHasHash = str_contains($this->excelName, '#') || ($realPath !== false && str_contains($realPath, '#'));
+        // 挿入順ではなく行番号順で書き出す（xlsxの行は昇順である必要がある）
+        sort($rowKeys, SORT_NUMERIC);
 
-        if ($realPath !== false && ! $pathHasHash) {
-            $zipUri = 'zip://'.$realPath.'#'.$sheetName;
-            $testReader = new XMLReader;
-            if (@$testReader->open($zipUri)) {
-                $testReader->close();
-
-                return [$zipUri, null];
+        foreach ($rowKeys as $rowKey) {
+            if ((int) $rowKey > $afterRow && ! empty($pendingValues[$rowKey])) {
+                fwrite($writer, $this->buildNewRowXml((string) $rowKey, $pendingValues[$rowKey]));
             }
         }
-
-        $tempName = $this->loadWorksheetFile($sheetName);
-        if (! $tempName) {
-            return ['', null];
-        }
-
-        return [$tempName, $tempName];
     }
 
     private function readerAttributesToXml(XMLReader $reader): string
@@ -346,18 +328,26 @@ trait ExcelSetTrait
     }
 
     /**
-     * 行XMLに対してpendingValuesを適用し、変更後のXML文字列を返す（1行分のみDOM使用・属性重複を防ぐ）
+     * 新規行のXMLを生成（既存行の編集と同じDOM処理を再利用する）
+     */
+    private function buildNewRowXml(string $rowName, array $cellValues): string
+    {
+        return $this->applyValuesToRowXml('<row/>', $rowName, $cellValues);
+    }
+
+    /**
+     * 行XMLに対してpendingValuesを適用し、変更後のXML文字列を返す（1行分のみDOM使用）
      */
     private function applyValuesToRowXml(string $rowXml, string $rowName, array $pendingValues): string
     {
-        $wrapper = '<?xml version="1.0"?><root xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'.$rowXml.'</root>';
+        $wrapper = '<?xml version="1.0"?><root xmlns="'.self::MAIN_NS.'">'.$rowXml.'</root>';
         $dom = new \DOMDocument;
         if (! @$dom->loadXML($wrapper)) {
             return $rowXml;
         }
 
         $xpath = new \DOMXPath($dom);
-        $xpath->registerNamespace('main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main');
+        $xpath->registerNamespace('main', self::MAIN_NS);
         $rowNodes = $xpath->query('//main:row');
         if ($rowNodes->length === 0) {
             return $rowXml;
@@ -367,20 +357,20 @@ trait ExcelSetTrait
 
         $rowNode->setAttribute('r', $rowName);
 
-        $cells = $xpath->query('.//main:c', $rowNode);
-        foreach ($cells as $cellNode) {
+        // 既存セルは値を差し替える
+        foreach ($xpath->query('.//main:c', $rowNode) as $cellNode) {
             /** @var \DOMElement $cellNode */
             $cellName = $cellNode->getAttribute('r');
             if ($cellName === '' || ! isset($pendingValues[$cellName])) {
                 continue;
             }
-            $value = $pendingValues[$cellName];
-            $this->applyCellValueToDom($cellNode, $value);
+            $this->applyCellValueToDom($cellNode, $pendingValues[$cellName]);
             unset($pendingValues[$cellName]);
         }
 
+        // 行に存在しなかったセルは新規に追加する
         foreach ($pendingValues as $cellName => $value) {
-            $cellNode = $dom->createElementNS('http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'c');
+            $cellNode = $dom->createElementNS(self::MAIN_NS, 'c');
             $cellNode->setAttribute('r', $cellName);
             $this->applyCellValueToDom($cellNode, $value);
             $rowNode->appendChild($cellNode);
@@ -388,9 +378,7 @@ trait ExcelSetTrait
 
         $this->sortRowCellsDom($rowNode, $xpath);
 
-        $rowXmlOut = $dom->saveXML($rowNode);
-
-        return $rowXmlOut;
+        return $dom->saveXML($rowNode);
     }
 
     /**
@@ -399,32 +387,44 @@ trait ExcelSetTrait
     private function applyCellValueToDom(\DOMElement $cellNode, $value): void
     {
         $cellNode->removeAttribute('t');
-        $vNodes = $cellNode->getElementsByTagNameNS('http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'v');
-        foreach ($vNodes as $v) {
-            $cellNode->removeChild($v);
+
+        // 既存の値・数式・インライン文字列を削除する
+        // （数式を残すと再計算時に設定した値が上書きされてしまう）
+        foreach (['v', 'f', 'is'] as $childName) {
+            foreach (iterator_to_array($cellNode->getElementsByTagNameNS(self::MAIN_NS, $childName)) as $childNode) {
+                $cellNode->removeChild($childNode);
+            }
         }
 
-        if (is_numeric($value)) {
-            $vNode = $cellNode->ownerDocument->createElementNS('http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'v');
+        $vNode = $cellNode->ownerDocument->createElementNS(self::MAIN_NS, 'v');
+        $cellNode->appendChild($vNode);
+
+        if ($this->shouldStoreAsNumber($value)) {
             $vNode->textContent = $value;
-            $cellNode->appendChild($vNode);
 
             return;
         }
 
-        isset($this->sharedStrings) || $this->loadSharedStrings();
+        // 文字列は共有文字列のインデックスで参照する
+        $cellNode->setAttribute('t', 's');
+        $vNode->textContent = (string) $this->resolveSharedStringIndex(strval($value));
+    }
+
+    /**
+     * 値に対応する共有文字列のインデックスを返す（未登録なら追加を予約する）
+     */
+    private function resolveSharedStringIndex(string $value): int
+    {
+        $this->sharedStringsLoaded || $this->loadSharedStrings();
+
         $stringIndex = $this->sharedStringsMap[$value] ?? null;
         if ($stringIndex === null) {
-            $this->sharedStrings[] = $value;
-            $this->pendingSharedStrings[] = $value;
-            $stringIndex = count($this->sharedStrings) - 1;
+            $stringIndex = $this->sharedStringsCount++;
             $this->sharedStringsMap[$value] = $stringIndex;
+            $this->pendingSharedStrings[] = $value;
         }
 
-        $cellNode->setAttribute('t', 's');
-        $vNode = $cellNode->ownerDocument->createElementNS('http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'v');
-        $vNode->textContent = (string) $stringIndex;
-        $cellNode->appendChild($vNode);
+        return $stringIndex;
     }
 
     /**
@@ -432,122 +432,73 @@ trait ExcelSetTrait
      */
     private function sortRowCellsDom(\DOMElement $rowNode, \DOMXPath $xpath): void
     {
-        $cells = $xpath->query('.//main:c', $rowNode);
-        $cellData = [];
+        $cells = iterator_to_array($xpath->query('.//main:c', $rowNode));
+
+        $sortedCells = [];
         foreach ($cells as $cellNode) {
             /** @var \DOMElement $cellNode */
-            $ref = $cellNode->getAttribute('r');
-            $colIdx = $this->columnNameToIndex($ref);
-            $rowIdx = (int) preg_replace('/[A-Z]+/', '', $ref);
-            $sortKey = sprintf('%05d-%05d', $colIdx, $rowIdx);
-            $cellData[$sortKey] = $cellNode->cloneNode(true);
+            $sortedCells[$this->columnNameToIndex($cellNode->getAttribute('r'))] = $cellNode;
         }
-        ksort($cellData);
+        ksort($sortedCells);
 
-        $cellsArray = iterator_to_array($cells);
-        foreach ($cellsArray as $cellNode) {
+        foreach ($cells as $cellNode) {
             $rowNode->removeChild($cellNode);
         }
-        foreach ($cellData as $cellClone) {
-            $rowNode->appendChild($cellClone);
+        foreach ($sortedCells as $cellNode) {
+            $rowNode->appendChild($cellNode);
         }
-    }
-
-    /**
-     * pending 行キーを Excel 行番号の昇順で返す（set() 呼び出し順とは独立）
-     *
-     * @param  array<string, true>  $targetRowNumbers
-     * @return list<string>
-     */
-    private function sortedPendingRowKeys(array $targetRowNumbers): array
-    {
-        $keys = array_keys($targetRowNumbers);
-        usort($keys, fn (string $a, string $b): int => (int) $a <=> (int) $b);
-
-        return $keys;
-    }
-
-    /**
-     * 新規行のXMLを生成
-     */
-    private function buildNewRowXml(string $rowName, array $cellValues): string
-    {
-        $row = new \SimpleXMLElement('<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>');
-        $row['r'] = $rowName;
-        foreach ($cellValues as $cellName => $value) {
-            $cell = $row->addChild('c');
-            $cell['r'] = $cellName;
-            $this->applyCellValue($cell, $value);
-        }
-        $this->sortRowCells($row);
-        $xml = $row->asXML();
-        $xml = preg_replace('/^<\\?xml[^>]*\\?>\s*/', '', $xml);
-
-        return $xml;
-    }
-
-    private function sortRowCells($row)
-    {
-        // 列の順序をソートしてセルを左から右へ並べ替える
-        $sortCellList = [];
-        $sortCellNameList = [];
-        foreach ($row->c as $cell) {
-            // ソートのために桁を揃えて比較用文字列に変換する
-            $sortCellName = sprintf('% 20s', strval($cell['r']));
-            $sortCellNameList[] = $sortCellName;
-            $sortCellList[$sortCellName] = clone $cell;
-        }
-        sort($sortCellNameList);
-
-        unset($row->c);
-        foreach ($sortCellNameList as $sortCellName) {
-            $this->appendChildNode($row, $sortCellList[$sortCellName]);
-        }
-    }
-
-    private function applyCellValue($cell, $value)
-    {
-        if (is_numeric($value)) {
-            $cell->v = $value;
-            // 文字列指定を削除して数値セルとして扱う
-            unset($cell['t']);
-
-            return;
-        }
-
-        isset($this->sharedStrings) || $this->loadSharedStrings();
-
-        $stringIndex = $this->sharedStringsMap[$value] ?? null;
-        if ($stringIndex === null) {
-            $this->sharedStrings[] = $value;
-            $this->pendingSharedStrings[] = $value;
-            $stringIndex = count($this->sharedStrings) - 1;
-            $this->sharedStringsMap[$value] = $stringIndex;
-        }
-
-        // セルに共有文字列のインデックスを設定する
-        $cell->v = $stringIndex;
-        $cell['t'] = 's';
     }
 
     private function loadSharedStrings()
     {
-        // 共有文字列XMLを読み込む
-        $sharedXml = $this->loadWorksheetXml($this->sharedName);
+        $this->sharedStringsLoaded = true;
 
-        // 存在しない場合は共有文字列XMLを初期化する
+        // 共有文字列XMLを読み込む（存在しない場合は初期化する）
+        $sharedXml = $this->loadWorksheetXml($this->sharedName);
         $sharedXml === false && $sharedXml = $this->initializeSharedStrings();
 
-        // 共有文字列を配列として保持し、O(1)ルックアップ用マップを構築する
-        $this->sharedStrings = [];
+        // 値からインデックスへのO(1)ルックアップ用マップを構築する
         $this->sharedStringsMap = [];
-        $index = 0;
+        $this->sharedStringsCount = 0;
         foreach ($sharedXml->si as $sharedSi) {
-            $str = strval($sharedSi->t);
-            $this->sharedStrings[] = $str;
-            $this->sharedStringsMap[$str] = $index;
-            $index++;
+            $this->sharedStringsMap[$this->sharedStringSiText($sharedSi)] = $this->sharedStringsCount++;
         }
+    }
+
+    /**
+     * 共有文字列のsi要素からテキストを取得する（読み取り側のパースと同じ結果になるようにする）
+     * リッチテキストをここで空文字扱いすると、set('')が誤って既存siを再利用してしまう
+     */
+    private function sharedStringSiText(\SimpleXMLElement $sharedSi): string
+    {
+        if (isset($sharedSi->t)) {
+            return str_replace('_x000D_', '', strval($sharedSi->t));
+        }
+
+        // リッチテキストはラン（r）内のtを連結する（ふりがなrPhは含めない）
+        $string = '';
+        foreach ($sharedSi->r as $run) {
+            $string .= strval($run->t);
+        }
+
+        return str_replace('_x000D_', '', $string);
+    }
+
+    /**
+     * 数値セルとして保存すべき値か判定する
+     * '007'のように数値化すると表記が変わる文字列は、文字列として保存して値を保全する
+     */
+    private function shouldStoreAsNumber($value): bool
+    {
+        if (is_int($value) || is_float($value)) {
+            return true;
+        }
+
+        if (! is_string($value) || ! is_numeric($value)) {
+            return false;
+        }
+
+        return $this->normalizeNumericCellValue($value) === $value;
     }
 
     private function updateSharedStringsXml()
@@ -555,32 +506,16 @@ trait ExcelSetTrait
         // 共有文字列XMLを読み込み、カウントを更新する
         $sharedXml = $this->loadWorksheetXml($this->sharedName);
 
-        // 共有文字列XMLへ新しい文字列を追加する
         $sharedXml['count'] = intval($sharedXml['count']) + count($this->pendingSharedStrings);
         $sharedXml['uniqueCount'] = intval($sharedXml['uniqueCount']) + count($this->pendingSharedStrings);
 
+        // 共有文字列XMLへ新しい文字列を追加する（addChildは&をエスケープしないため事前に変換）
         foreach ($this->pendingSharedStrings as $value) {
             $addString = $sharedXml->addChild('si');
             $addString->addChild('t', str_replace('&', '&amp;', $value));
         }
 
         $this->worksheetXml[$this->sharedName] = $sharedXml;
-    }
-
-    private function appendChildNode(\SimpleXMLElement $target, \SimpleXMLElement $addElement)
-    {
-        if (strval($addElement) !== '') {
-            $child = $target->addChild($addElement->getName(), str_replace('&', '&amp;', strval($addElement)));
-        } else {
-            $child = $target->addChild($addElement->getName());
-        }
-
-        foreach ($addElement->attributes() as $attName => $attVal) {
-            $child->addAttribute(strval($attName), strval($attVal));
-        }
-        foreach ($addElement->children() as $addChild) {
-            $this->appendChildNode($child, $addChild);
-        }
     }
 
     /**
@@ -602,22 +537,18 @@ trait ExcelSetTrait
         $this->shouldAddSharedStrings = true;
 
         $contentString = $this->loadWorksheetString('[Content_Types].xml');
-        $contentString = substr($contentString, 0, -8);
-        $contentString .= <<< 'END_of_HTML'
-<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>
-END_of_HTML;
+        $contentString = substr($contentString, 0, -strlen('</Types>'));
+        $contentString .= '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>';
         $this->worksheetXml['[Content_Types].xml'] = new \SimpleXMLElement($contentString);
 
         $relsString = $this->loadWorksheetString('xl/_rels/workbook.xml.rels');
         $nextRid = $this->getNextRelationshipId($relsString);
-        $relsString = substr($relsString, 0, -16);
+        $relsString = substr($relsString, 0, -strlen('</Relationships>'));
         $relsString .= '<Relationship Id="'.$nextRid.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>';
         $this->worksheetXml['xl/_rels/workbook.xml.rels'] = new \SimpleXMLElement($relsString);
 
-        $sharedString = <<< 'END_of_HTML'
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>
-END_of_HTML;
+        $sharedString = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'."\n"
+            .'<sst xmlns="'.self::MAIN_NS.'" count="0" uniqueCount="0"></sst>';
         $this->worksheetXml[$this->sharedName] = new \SimpleXMLElement($sharedString);
 
         return $this->worksheetXml[$this->sharedName];
