@@ -219,7 +219,8 @@ trait ExcelSetTrait
 
                     if ($isEmptySheetData) {
                         // 空要素はEND_ELEMENTイベントが発生しないため、ここで追加行を書き出して閉じる
-                        foreach (array_keys($targetRowNumbers) as $rKey) {
+                        // set() 呼び出し順ではなく行番号昇順で書き、Excel の修復ダイアログを防ぐ
+                        foreach ($this->sortedPendingRowKeys($targetRowNumbers) as $rKey) {
                             if (isset($pendingValues[$rKey]) && ! empty($pendingValues[$rKey])) {
                                 fwrite($writer, $this->buildNewRowXml($rKey, $pendingValues[$rKey]));
                             }
@@ -260,7 +261,8 @@ trait ExcelSetTrait
 
                 if ($inSheetData && $reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'sheetData') {
                     $lastRowNum = $expectedRow - 1;
-                    foreach (array_keys($targetRowNumbers) as $rKey) {
+                    // 末尾追記も行番号昇順（set順だとヘッダーより下の行が先に来るケースがある）
+                    foreach ($this->sortedPendingRowKeys($targetRowNumbers) as $rKey) {
                         $r = (int) $rKey;
                         if ($r > $lastRowNum && isset($pendingValues[$rKey]) && ! empty($pendingValues[$rKey])) {
                             fwrite($writer, $this->buildNewRowXml($rKey, $pendingValues[$rKey]));
@@ -449,6 +451,20 @@ trait ExcelSetTrait
         foreach ($cellData as $cellClone) {
             $rowNode->appendChild($cellClone);
         }
+    }
+
+    /**
+     * pending 行キーを Excel 行番号の昇順で返す（set() 呼び出し順とは独立）
+     *
+     * @param  array<string, true>  $targetRowNumbers
+     * @return list<string>
+     */
+    private function sortedPendingRowKeys(array $targetRowNumbers): array
+    {
+        $keys = array_keys($targetRowNumbers);
+        usort($keys, fn (string $a, string $b): int => (int) $a <=> (int) $b);
+
+        return $keys;
     }
 
     /**
