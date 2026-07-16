@@ -223,6 +223,42 @@ class ExcelRegressionTest extends ExcelTestCase
         $this->assertSame('99', $result->get(1, 0, 0));
     }
 
+    public function test_set_omits_stale_calc_chain_after_formula_cell_overwrite(): void
+    {
+        // 数式セルを静的値化したあと calcChain.xml が残ると Excel が修復ダイアログを出す
+        // （sample.xlsx の B8 = SUM(B4:B7) を set(1, 'B', '8', 300) したケース相当）
+        $path = $this->buildXlsx(
+            [
+                'S1' => self::row(4, self::numCell('B4', '10'))
+                    .self::row(5, self::numCell('B5', '20'))
+                    .self::row(6, self::numCell('B6', '30'))
+                    .self::row(7, self::numCell('B7', '40'))
+                    .self::row(8, '<c r="B8" s="9"><f>SUM(B4:B7)</f><v>0</v></c>'),
+            ],
+            [],
+            ['calcChain' => ['B8']]
+        );
+
+        $this->assertNotFalse($this->zipEntry($path, 'xl/calcChain.xml'));
+        $this->assertStringContainsString('/xl/calcChain.xml', $this->zipEntry($path, '[Content_Types].xml'));
+        $this->assertStringContainsString('/relationships/calcChain', $this->zipEntry($path, 'xl/_rels/workbook.xml.rels'));
+
+        $excel = new Excel($path);
+        $excel->set(1, 'B', '8', 300);
+        $generated = $this->generateToFile($excel);
+
+        $this->assertFalse($this->zipEntry($generated, 'xl/calcChain.xml'));
+        $this->assertStringNotContainsString('/xl/calcChain.xml', $this->zipEntry($generated, '[Content_Types].xml'));
+        $this->assertStringNotContainsString('/relationships/calcChain', $this->zipEntry($generated, 'xl/_rels/workbook.xml.rels'));
+
+        $sheetXml = $this->zipEntry($generated, 'xl/worksheets/sheet1.xml');
+        $this->assertStringNotContainsString('<f>', $sheetXml);
+        $this->assertStringContainsString('<c r="B8" s="9"><v>300</v></c>', $sheetXml);
+
+        $result = new Excel($generated);
+        $this->assertSame('300', $result->get(1, 'B', '8'));
+    }
+
     public function test_appended_rows_sorted_by_row_number(): void
     {
         // 最終行より後ろへの追記行が挿入順（行番号順でない）で書かれていた
