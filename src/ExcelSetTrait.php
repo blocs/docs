@@ -82,6 +82,11 @@ trait ExcelSetTrait
         // 文字列を追加するため共有文字列XMLを更新する
         empty($this->pendingSharedStrings) || $this->updateSharedStringsXml();
 
+        // 数式セルを静的値化したあとに calcChain が残ると Excel が修復ダイアログを出すため除外する
+        $shouldOmitCalcChain = ! empty($this->pendingCellValues)
+            && $this->excelTemplate->statName('xl/calcChain.xml');
+        $shouldOmitCalcChain && $this->removeCalcChainPackageParts();
+
         $excelTemplate = $this->excelTemplate;
 
         // テンポラリファイルを作成してZip書き込み用に確保する
@@ -94,6 +99,10 @@ trait ExcelSetTrait
         for ($i = 0; $i < $excelTemplate->numFiles; $i++) {
             $sheetName = $excelTemplate->getNameIndex($i);
             $worksheetString = $excelTemplate->getFromIndex($i);
+
+            if ($shouldOmitCalcChain && $sheetName === 'xl/calcChain.xml') {
+                continue;
+            }
 
             if ($sheetName == 'xl/workbook.xml') {
                 $excelGenerate->addFromString($sheetName, $this->buildWorkbookXml($worksheetString));
@@ -138,6 +147,41 @@ trait ExcelSetTrait
         }
 
         return $excelGenerated;
+    }
+
+    /**
+     * calcChain パートへの参照を Content_Types と workbook.xml.rels から除去する
+     * （パート本体は generate() の Zip ループでスキップする）
+     */
+    private function removeCalcChainPackageParts(): void
+    {
+        $contentTypes = $this->loadWorksheetXml('[Content_Types].xml');
+        if ($contentTypes !== false) {
+            $overridesToRemove = [];
+            foreach ($contentTypes->Override as $override) {
+                if ((string) $override['PartName'] === '/xl/calcChain.xml') {
+                    $overridesToRemove[] = $override;
+                }
+            }
+            foreach ($overridesToRemove as $override) {
+                $domNode = dom_import_simplexml($override);
+                $domNode->parentNode->removeChild($domNode);
+            }
+        }
+
+        $workbookRels = $this->loadWorksheetXml('xl/_rels/workbook.xml.rels');
+        if ($workbookRels !== false) {
+            $relationshipsToRemove = [];
+            foreach ($workbookRels->Relationship as $relationship) {
+                if (str_ends_with((string) $relationship['Type'], '/relationships/calcChain')) {
+                    $relationshipsToRemove[] = $relationship;
+                }
+            }
+            foreach ($relationshipsToRemove as $relationship) {
+                $domNode = dom_import_simplexml($relationship);
+                $domNode->parentNode->removeChild($domNode);
+            }
+        }
     }
 
     /**

@@ -54,7 +54,8 @@ abstract class ExcelTestCase extends TestCase
      *
      * @param  array<string, string|array{rows?: string, pre?: string, post?: string, selfClose?: bool}>  $sheets  シート名 => sheetData内の行XML、または連想配列で詳細指定
      * @param  array<int, string>|null  $sharedStrings  共有文字列（'<si'始まりは生XMLとして扱う、nullならsharedStrings.xmlなし）
-     * @param  array{calcPr?: bool}  $options
+     * @param  array{calcPr?: bool, calcChain?: array<int, string>|true}  $options
+     *                                                                              calcChain: true で A1 を登録、または calcChain に含めるセル参照の配列
      */
     protected function buildXlsx(array $sheets, ?array $sharedStrings = null, array $options = []): string
     {
@@ -83,6 +84,7 @@ abstract class ExcelTestCase extends TestCase
                 .'</worksheet>';
         }
 
+        $nextRid = $sheetIndex + 1;
         $sharedStringsXml = null;
         if ($sharedStrings !== null) {
             $siXml = '';
@@ -96,7 +98,22 @@ abstract class ExcelTestCase extends TestCase
                 .'<sst xmlns="'.self::MAIN_NS.'" count="'.$count.'" uniqueCount="'.$count.'">'
                 .$siXml.'</sst>';
             $overrides .= '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>';
-            $workbookRels .= '<Relationship Id="rId'.($sheetIndex + 1).'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>';
+            $workbookRels .= '<Relationship Id="rId'.$nextRid.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>';
+            $nextRid++;
+        }
+
+        $calcChainXml = null;
+        if (! empty($options['calcChain'])) {
+            $calcCells = $options['calcChain'] === true ? ['A1'] : $options['calcChain'];
+            $calcChainEntries = '';
+            foreach ($calcCells as $index => $cellRef) {
+                $calcChainEntries .= '<c r="'.htmlspecialchars((string) $cellRef, ENT_XML1 | ENT_QUOTES).'" i="1"'
+                    .($index === 0 ? ' l="1"' : '').'/>';
+            }
+            $calcChainXml = $xmlHeader
+                .'<calcChain xmlns="'.self::MAIN_NS.'">'.$calcChainEntries.'</calcChain>';
+            $overrides .= '<Override PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"/>';
+            $workbookRels .= '<Relationship Id="rId'.$nextRid.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/>';
         }
 
         // initializeSharedStrings()がsubstrで末尾タグを削るため、末尾に改行等を付けないこと
@@ -131,6 +148,7 @@ abstract class ExcelTestCase extends TestCase
             'xl/_rels/workbook.xml.rels' => $workbookXmlRels,
         ] + $sheetEntries;
         $sharedStringsXml === null || $entries['xl/sharedStrings.xml'] = $sharedStringsXml;
+        $calcChainXml === null || $entries['xl/calcChain.xml'] = $calcChainXml;
 
         return $this->buildRawXlsx($entries);
     }
