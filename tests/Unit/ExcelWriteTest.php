@@ -233,4 +233,84 @@ class ExcelWriteTest extends ExcelTestCase
         $this->assertSame('saved', $result->get(1, 0, 0));
         $this->assertSame('value', $result->get(1, 1, 0));
     }
+
+    public function test_save_does_not_empty_existing_file_when_template_is_missing(): void
+    {
+        $existing = $this->tempFile();
+        file_put_contents($existing, 'IMPORTANT');
+
+        $excel = new Excel('/no/such/file.xlsx');
+        $this->assertFalse($excel->save($existing));
+        $this->assertSame('IMPORTANT', file_get_contents($existing));
+    }
+
+    public function test_generate_can_be_called_twice_on_the_same_instance(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '1')),
+        ], []);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, 'first');
+        $this->assertNotFalse($excel->generate());
+
+        $excel->set(1, 0, 0, 'second');
+        $generated = $this->generateToFile($excel);
+
+        $result = new Excel($generated);
+        $this->assertSame('second', $result->get(1, 0, 0));
+    }
+
+    public function test_name_can_be_called_twice_on_the_same_instance(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '1')),
+        ], []);
+
+        // 1回目の name() だけを積んで生成する（set() を挟まない）
+        $excel = new Excel($path);
+        $excel->name(1, 'FIRST');
+        $first = new Excel($this->generateToFile($excel));
+        $this->assertSame(['FIRST'], $first->sheetNames());
+
+        // Zip を開き直しても、2回目に積んだシート名が消えない
+        $excel->name(1, 'SECOND');
+        $second = new Excel($this->generateToFile($excel));
+        $this->assertSame(['SECOND'], $second->sheetNames());
+    }
+
+    public function test_name_by_sheet_name_works_after_generate(): void
+    {
+        $path = $this->buildXlsx([
+            'One' => self::row(1, self::numCell('A1', '1')),
+            'Two' => self::row(1, self::numCell('A1', '2')),
+        ], []);
+
+        $excel = new Excel($path);
+        $excel->name('Two', '一回目');
+        $this->assertNotFalse($excel->generate());
+
+        // シート名での解決も、閉じた Zip を開き直して行われる
+        $excel->name('Two', '二回目');
+        $result = new Excel($this->generateToFile($excel));
+        $this->assertSame(['One', '二回目'], $result->sheetNames());
+    }
+
+    public function test_save_to_template_path_keeps_previous_values_on_next_save(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '0').self::numCell('B1', '0')),
+        ], []);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, 'first');
+        $this->assertTrue($excel->save($path));
+
+        $excel->set(1, 1, 0, 'second');
+        $this->assertTrue($excel->save($path));
+
+        $result = new Excel($path);
+        $this->assertSame('first', $result->get(1, 0, 0));
+        $this->assertSame('second', $result->get(1, 1, 0));
+    }
 }

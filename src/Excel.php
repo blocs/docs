@@ -216,17 +216,69 @@ class Excel
      */
     public function sheetNames(): array
     {
+        if (! $this->ensureTemplateLoaded()) {
+            return [];
+        }
+
         return $this->loadSheetIndex()['names'];
     }
 
     /**
-     * シート指定からZip内に実在するワークシートパスを解決する
-     *
-     * @return string|false
+     * generate() 後に閉じた Zip を、必要なら元ファイルから開き直す
      */
+    private function ensureTemplateLoaded(): bool
+    {
+        if ($this->templateLoaded) {
+            return true;
+        }
+
+        return $this->reopenTemplate();
+    }
+
+    /**
+     * テンプレート Zip を開き直す。
+     * set() / name() で積んだ保留値は破棄しない（generate() 前の開き直しで指定が消えないように）。
+     */
+    private function reopenTemplate(): bool
+    {
+        $this->excelTemplate = new \ZipArchive;
+        $this->templateLoaded = is_file($this->excelName) && $this->excelTemplate->open($this->excelName) === true;
+        $this->resetReadCaches();
+
+        return $this->templateLoaded;
+    }
+
+    /**
+     * 生成後に残る保留値と XML キャッシュを捨て、再利用時に二重適用しない
+     */
+    private function resetPackageCaches(): void
+    {
+        $this->resetReadCaches();
+        $this->pendingCellValues = [];
+        $this->pendingSheetNames = [];
+    }
+
+    /**
+     * テンプレート由来のキャッシュだけを捨てる（保留中の set() / name() は残す）
+     */
+    private function resetReadCaches(): void
+    {
+        $this->worksheetXml = [];
+        $this->readSharedStringsCache = [];
+        $this->readSharedStringsLoaded = false;
+        $this->sheetIndexCache = null;
+        $this->sharedFormulasCache = [];
+        $this->readCellCache = [];
+        $this->sharedStringsLoaded = false;
+        $this->sharedStringsCount = 0;
+        $this->sharedStringsMap = [];
+        $this->shouldAddSharedStrings = false;
+        $this->pendingSharedStrings = [];
+    }
+
     private function findWorksheet($sheetNo)
     {
-        if (! $this->templateLoaded) {
+        if (! $this->ensureTemplateLoaded()) {
             return false;
         }
 
@@ -720,7 +772,15 @@ class Excel
         }
 
         $tempName = $this->createTempFileName();
-        stream_copy_to_stream($fp, fopen($tempName, 'w'));
+        $out = fopen($tempName, 'w');
+        if ($out === false) {
+            fclose($fp);
+
+            return false;
+        }
+
+        stream_copy_to_stream($fp, $out);
+        fclose($out);
         fclose($fp);
 
         return $tempName;
@@ -761,6 +821,9 @@ class Excel
      */
     private function loadSheetIndex(): array
     {
+        // name() のようにシート名解決だけを行う経路でも Zip を開き直す
+        $this->ensureTemplateLoaded();
+
         if ($this->sheetIndexCache !== null) {
             return $this->sheetIndexCache;
         }

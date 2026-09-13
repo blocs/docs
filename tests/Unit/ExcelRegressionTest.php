@@ -326,4 +326,34 @@ class ExcelRegressionTest extends ExcelTestCase
         $excel->open(1);
         $this->assertFalse($excel->first());
     }
+
+    public function test_set_string_on_workbook_with_trailing_newlines_in_content_types(): void
+    {
+        $path = $this->buildXlsx(
+            ['S1' => ['selfClose' => true]],
+            null,
+            ['trailingNewline' => true]
+        );
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, 'hello');
+        $generated = $this->generateToFile($excel);
+
+        $result = new Excel($generated);
+        $this->assertSame('hello', $result->get(1, 0, 0));
+    }
+
+    public function test_set_strips_xml_control_characters_from_strings(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::sharedCell('A1', 0)),
+        ], ['old']);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, "a\x01b");
+        $generated = $this->generateToFile($excel);
+
+        $result = new Excel($generated);
+        $this->assertSame('ab', $result->get(1, 0, 0));
+    }
 }
