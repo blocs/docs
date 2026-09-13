@@ -52,7 +52,12 @@ trait ExcelSetTrait
         isset($filename) || $filename = basename($this->excelName);
         $filename = rawurlencode($filename);
 
-        return response($this->generate())
+        $contents = $this->generate();
+        if ($contents === false) {
+            return response('', 500);
+        }
+
+        return response($contents)
             ->header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
             ->header('Content-Disposition', 'inline;filename*=UTF-8\'\''.$filename)
             ->header('Cache-Control', 'max-age=0');
@@ -62,12 +67,23 @@ trait ExcelSetTrait
     {
         isset($filename) || $filename = basename($this->excelName);
 
-        file_put_contents($filename, $this->generate()) && chmod($filename, 0666);
+        $contents = $this->generate();
+        if ($contents === false) {
+            return false;
+        }
+
+        if (file_put_contents($filename, $contents) === false) {
+            return false;
+        }
+
+        chmod($filename, 0644);
+
+        return true;
     }
 
     public function generate()
     {
-        if (! $this->templateLoaded) {
+        if (! $this->ensureTemplateLoaded()) {
             return false;
         }
 
@@ -133,6 +149,7 @@ trait ExcelSetTrait
 
         $excelTemplate->close();
         $excelGenerate->close();
+        $this->templateLoaded = false;
 
         $excelGenerated = file_get_contents($generateName);
         is_file($generateName) && unlink($generateName);
@@ -142,9 +159,10 @@ trait ExcelSetTrait
         foreach ($this->worksheetXml as $sheetName => $entry) {
             if (is_string($entry)) {
                 is_file($entry) && unlink($entry);
-                unset($this->worksheetXml[$sheetName]);
             }
         }
+
+        $this->resetPackageCaches();
 
         return $excelGenerated;
     }
@@ -443,6 +461,10 @@ trait ExcelSetTrait
         $vNode = $cellNode->ownerDocument->createElementNS(self::MAIN_NS, 'v');
         $cellNode->appendChild($vNode);
 
+        if (is_string($value)) {
+            $value = $this->sanitizeXmlText($value);
+        }
+
         if ($this->shouldStoreAsNumber($value)) {
             $vNode->textContent = $value;
 
@@ -460,6 +482,8 @@ trait ExcelSetTrait
     private function resolveSharedStringIndex(string $value): int
     {
         $this->sharedStringsLoaded || $this->loadSharedStrings();
+
+        $value = $this->sanitizeXmlText($value);
 
         $stringIndex = $this->sharedStringsMap[$value] ?? null;
         if ($stringIndex === null) {
@@ -491,6 +515,16 @@ trait ExcelSetTrait
         foreach ($sortedCells as $cellNode) {
             $rowNode->appendChild($cellNode);
         }
+    }
+
+    /**
+     * XML 1.0 で不正な制御文字を取り除く
+     */
+    private function sanitizeXmlText(string $value): string
+    {
+        $sanitized = preg_replace('/[^\x{0009}\x{000A}\x{000D}\x{0020}-\x{D7FF}\x{E000}-\x{FFFD}]/u', '', $value);
+
+        return is_string($sanitized) ? $sanitized : '';
     }
 
     private function loadSharedStrings()
@@ -576,19 +610,37 @@ trait ExcelSetTrait
         return 'rId1';
     }
 
+    /**
+     * ルート終了タグの直前に要素を挿入する（末尾改行や空白を壊さない）
+     */
+    private function insertXmlBeforeClosingTag(string $xml, string $closingTag, string $insert): string
+    {
+        $pos = strrpos($xml, $closingTag);
+        if ($pos === false) {
+            return $xml.$insert.$closingTag;
+        }
+
+        return substr($xml, 0, $pos).$insert.substr($xml, $pos);
+    }
+
     private function initializeSharedStrings()
     {
         $this->shouldAddSharedStrings = true;
 
-        $contentString = $this->loadWorksheetString('[Content_Types].xml');
-        $contentString = substr($contentString, 0, -strlen('</Types>'));
-        $contentString .= '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>';
+        $contentString = $this->insertXmlBeforeClosingTag(
+            $this->loadWorksheetString('[Content_Types].xml'),
+            '</Types>',
+            '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+        );
         $this->worksheetXml['[Content_Types].xml'] = new \SimpleXMLElement($contentString);
 
         $relsString = $this->loadWorksheetString('xl/_rels/workbook.xml.rels');
         $nextRid = $this->getNextRelationshipId($relsString);
-        $relsString = substr($relsString, 0, -strlen('</Relationships>'));
-        $relsString .= '<Relationship Id="'.$nextRid.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>';
+        $relsString = $this->insertXmlBeforeClosingTag(
+            $relsString,
+            '</Relationships>',
+            '<Relationship Id="'.$nextRid.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
+        );
         $this->worksheetXml['xl/_rels/workbook.xml.rels'] = new \SimpleXMLElement($relsString);
 
         $sharedString = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'."\n"

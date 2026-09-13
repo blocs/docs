@@ -116,24 +116,30 @@ abstract class ExcelTestCase extends TestCase
             $workbookRels .= '<Relationship Id="rId'.$nextRid.'" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/>';
         }
 
-        // initializeSharedStrings()がsubstrで末尾タグを削るため、末尾に改行等を付けないこと
+        $closeTypes = '</Types>';
+        $closeRels = '</Relationships>';
+        if (! empty($options['trailingNewline'])) {
+            $closeTypes .= "\n";
+            $closeRels .= "\n";
+        }
+
         $contentTypes = $xmlHeader
             .'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
             .'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
             .'<Default Extension="xml" ContentType="application/xml"/>'
             .'<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
             .$overrides
-            .'</Types>';
+            .$closeTypes;
 
         $rootRels = $xmlHeader
             .'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             .'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-            .'</Relationships>';
+            .$closeRels;
 
         $workbookXmlRels = $xmlHeader
             .'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             .$workbookRels
-            .'</Relationships>';
+            .$closeRels;
 
         $workbook = $xmlHeader
             .'<workbook xmlns="'.self::MAIN_NS.'" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'

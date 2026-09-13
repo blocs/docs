@@ -27,14 +27,12 @@ class Docs
         }
 
         // 現在のコントローラーとメソッドを判定
-        $currentRouteAction = ltrim(str_replace('\\', '/', Route::currentRouteAction()), '/');
-        $currentRouteAction = str_replace('App/Http/Controllers/', '', $currentRouteAction);
-        empty($currentRouteAction) && $currentRouteAction = 'class@method';
+        $currentRouteAction = $this->resolveCurrentRouteAction();
         [$routeClass, $routeMethod] = explode('@', $currentRouteAction, 2);
 
         // ドキュメント用のエクセルファイルを準備
         $excelPath = base_path("docs/{$currentRouteAction}.xlsx");
-        is_dir(dirname($excelPath)) || mkdir(dirname($excelPath), 0777, true);
+        is_dir(dirname($excelPath)) || mkdir(dirname($excelPath), 0755, true);
         copy(base_path('docs/format.xlsx'), $excelPath);
         $excel = new Excel($excelPath);
 
@@ -49,18 +47,26 @@ class Docs
         if (count($steps)) {
             $endNo = count($steps) - 1;
 
-            if (! $steps[$endNo]['in'] && $response->getStatusCode() === 200 && is_object($response->original) && method_exists($response->original, 'getPath')) {
-                // 画面描画の入力情報を補完
-                $viewPath = str_replace(resource_path('views/'), '', $response->original->getPath());
-                $viewPath && $steps[$endNo]['in'] = ['テンプレート' => '!'.$viewPath];
+            if (! $steps[$endNo]['in'] && $response->getStatusCode() === 200) {
+                $original = $response instanceof \Illuminate\Http\Response
+                    ? $response->getOriginalContent()
+                    : null;
+                if (is_object($original) && method_exists($original, 'getPath')) {
+                    // 画面描画の入力情報を補完
+                    $viewPath = str_replace(resource_path('views/'), '', $original->getPath());
+                    $viewPath && $steps[$endNo]['in'] = ['テンプレート' => '!'.$viewPath];
+                }
             }
 
             if (! $steps[$endNo]['out']) {
                 // 画面描画の出力情報を補完
                 if ($response->getStatusCode() === 200) {
-                    $contents = str_replace(["\r\n", "\r", "\n"], '', $response->getContent());
-                    if (preg_match('/<title>(.*?)<\/title>/i', $contents, $match)) {
-                        $steps[$endNo]['out'] = ['HTML' => '!'.trim($match[1])];
+                    $contents = $response->getContent();
+                    if (is_string($contents) && $contents !== '') {
+                        $contents = str_replace(["\r\n", "\r", "\n"], '', substr($contents, 0, 200000));
+                        if (preg_match('/<title>(.*?)<\/title>/i', $contents, $match)) {
+                            $steps[$endNo]['out'] = ['HTML' => '!'.trim($match[1])];
+                        }
                     }
                 }
             }
@@ -290,15 +296,47 @@ class Docs
     private function findSupplementaryComment($item)
     {
         $item = preg_replace("/\s/", '', $item);
-        $commentKeys = array_keys($this->commentMap);
-        foreach ($commentKeys as $commentKey) {
-            $commentKey = preg_replace("/\s/", '', $commentKey);
+        foreach ($this->commentMap as $commentKey => $comment) {
+            $normalizedKey = preg_replace("/\s/", '', $commentKey);
+            if ($normalizedKey === '') {
+                continue;
+            }
 
-            if (strpos($item, $commentKey) !== false) {
-                return $this->commentMap[$commentKey];
+            if (strpos($item, $normalizedKey) !== false) {
+                return $comment;
             }
         }
 
         return false;
+    }
+
+    /**
+     * ルートアクションを Controller@method 形式に正規化する
+     */
+    private function resolveCurrentRouteAction(): string
+    {
+        return self::normalizeRouteAction(Route::currentRouteAction());
+    }
+
+    /**
+     * @internal テストから正規化結果を検証する
+     */
+    public static function normalizeRouteAction(mixed $currentRouteAction): string
+    {
+        if (! is_string($currentRouteAction) || $currentRouteAction === '') {
+            return 'class@method';
+        }
+
+        $currentRouteAction = ltrim(str_replace('\\', '/', $currentRouteAction), '/');
+        $currentRouteAction = str_replace('App/Http/Controllers/', '', $currentRouteAction);
+        if ($currentRouteAction === '') {
+            return 'class@method';
+        }
+
+        if (! str_contains($currentRouteAction, '@')) {
+            $currentRouteAction .= '@__invoke';
+        }
+
+        return $currentRouteAction;
     }
 }
