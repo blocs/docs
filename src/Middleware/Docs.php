@@ -27,7 +27,7 @@ class Docs
         }
 
         // 現在のコントローラーとメソッドを判定
-        $currentRouteAction = $this->resolveCurrentRouteAction();
+        $currentRouteAction = self::normalizeRouteAction(Route::currentRouteAction());
         [$routeClass, $routeMethod] = explode('@', $currentRouteAction, 2);
 
         // ドキュメント用のエクセルファイルを準備
@@ -83,7 +83,7 @@ class Docs
             $maxLine = $startLine;
 
             // 入力情報を記述
-            $line = $this->fillInputRows($startLine, $step, $excel);
+            $line = $this->fillIoRows($startLine, $step['in'], $excel, ['A' => null, 'J' => '→'], 'B');
             $line > $maxLine && $maxLine = $line;
 
             // 処理手順を記述
@@ -91,7 +91,7 @@ class Docs
             $line > $maxLine && $maxLine = $line;
 
             // 出力情報を記述
-            $line = $this->fillOutputRows($startLine, $step, $excel);
+            $line = $this->fillIoRows($startLine, $step['out'], $excel, ['AO' => '→', 'AP' => null], 'AQ');
             $line > $maxLine && $maxLine = $line;
 
             // 開始行更新
@@ -103,16 +103,20 @@ class Docs
         return $response;
     }
 
-    private function fillInputRows($line, $step, $excel)
+    /**
+     * @param  array<string, string|null>  $header  列 => 固定値（null はキー名）
+     */
+    private function fillIoRows($line, array $rows, $excel, array $header, string $valueColumn)
     {
-        foreach ($step['in'] as $key => $items) {
-            $excel->set(1, 'A', $line, $key);
-            $excel->set(1, 'J', $line, '→');
+        foreach ($rows as $key => $items) {
+            foreach ($header as $column => $value) {
+                $excel->set(1, $column, $line, $value ?? $key);
+            }
             $line++;
 
             is_array($items) || $items = array_filter([$items], 'strlen');
             foreach ($items as $item) {
-                $excel->set(1, 'B', $line, $this->normalizeInOutValue($item));
+                $excel->set(1, $valueColumn, $line, $this->normalizeInOutValue($item));
                 $line++;
             }
         }
@@ -135,16 +139,16 @@ class Docs
             $column = $headline ? 'K' : 'L';
             $pathColumn = $headline ? 'L' : 'M';
             $process = $this->normalizeProcessValue($process);
+            $label = $headline
+                ? $headlineNo.'. '.$process
+                : $indentNo.') '.$process;
             if ($headline) {
-                // 見出し行を記述
-                $excel->set(1, $column, $line, $headlineNo.'. '.$process);
                 $headlineNo++;
                 $indentNo = 1;
             } else {
-                // 見出し配下の処理を記述
-                $excel->set(1, $column, $line, $indentNo.') '.$process);
                 $indentNo++;
             }
+            $excel->set(1, $column, $line, $label);
             $line++;
 
             // 追加コメントを補完
@@ -152,12 +156,12 @@ class Docs
             ($addComment = $this->findSupplementaryComment($process)) && $comments = array_merge($comments, explode("\n", $addComment));
 
             // バリデーション情報を整形
-            count($step['validate']) && $comments[] .= '<入力値>: <条件>: <メッセージ>';
+            count($step['validate']) && $comments[] = '<入力値>: <条件>: <メッセージ>';
             foreach ($step['validate'] as $validate) {
                 $validateComment = '・'.$validate['name'];
                 empty($validate['validate']) || $validateComment .= ': '.$validate['validate'];
                 empty($validate['message']) || $validateComment .= ': '.$validate['message'];
-                $comments[] .= $validateComment;
+                $comments[] = $validateComment;
             }
 
             foreach ($comments as $comment) {
@@ -170,23 +174,6 @@ class Docs
         $path = str_replace(base_path().'/', '', $step['path']);
         $excel->set(1, $pathColumn, $line, $path.'@'.$step['function'].':'.$step['line']);
         $line++;
-
-        return ++$line;
-    }
-
-    private function fillOutputRows($line, $step, $excel)
-    {
-        foreach ($step['out'] as $key => $items) {
-            $excel->set(1, 'AO', $line, '→');
-            $excel->set(1, 'AP', $line, $key);
-            $line++;
-
-            is_array($items) || $items = array_filter([$items], 'strlen');
-            foreach ($items as $item) {
-                $excel->set(1, 'AQ', $line, $this->normalizeInOutValue($item));
-                $line++;
-            }
-        }
 
         return ++$line;
     }
@@ -225,22 +212,13 @@ class Docs
             isset($config[$routeMethod]['neglect']) && $neglectPatterns = array_merge($neglectPatterns, $config[$routeMethod]['neglect']);
 
             // 追加コメントを取得
-            isset($config['comment']) && $commentMap = $this->mergeConfig($commentMap, $config['comment']);
-            isset($config[$routeMethod]['comment']) && $commentMap = $this->mergeConfig($commentMap, $config[$routeMethod]['comment']);
+            isset($config['comment']) && $commentMap = array_replace($commentMap, $config['comment']);
+            isset($config[$routeMethod]['comment']) && $commentMap = array_replace($commentMap, $config[$routeMethod]['comment']);
         }
 
         $this->keywords = $keywords;
         $this->neglectPatterns = $neglectPatterns;
         $this->commentMap = $commentMap;
-    }
-
-    private function mergeConfig(array $before, array $after): array
-    {
-        foreach ($after as $key => $value) {
-            $before[$key] = $value;
-        }
-
-        return $before;
     }
 
     private function normalizeInOutValue($item)
@@ -281,11 +259,9 @@ class Docs
 
     private function shouldSkipStep($item)
     {
-        $item = preg_replace("/\s/", '', $item);
+        $item = $this->stripWhitespace($item);
         foreach ($this->neglectPatterns as $neglect) {
-            $neglect = preg_replace("/\s/", '', $neglect);
-
-            if (strpos($item, $neglect) !== false) {
+            if (strpos($item, $this->stripWhitespace($neglect)) !== false) {
                 return true;
             }
         }
@@ -295,14 +271,10 @@ class Docs
 
     private function findSupplementaryComment($item)
     {
-        $item = preg_replace("/\s/", '', $item);
+        $item = $this->stripWhitespace($item);
         foreach ($this->commentMap as $commentKey => $comment) {
-            $normalizedKey = preg_replace("/\s/", '', $commentKey);
-            if ($normalizedKey === '') {
-                continue;
-            }
-
-            if (strpos($item, $normalizedKey) !== false) {
+            $normalizedKey = $this->stripWhitespace($commentKey);
+            if ($normalizedKey !== '' && strpos($item, $normalizedKey) !== false) {
                 return $comment;
             }
         }
@@ -310,12 +282,9 @@ class Docs
         return false;
     }
 
-    /**
-     * ルートアクションを Controller@method 形式に正規化する
-     */
-    private function resolveCurrentRouteAction(): string
+    private function stripWhitespace($item): string
     {
-        return self::normalizeRouteAction(Route::currentRouteAction());
+        return preg_replace("/\s/", '', (string) $item);
     }
 
     /**

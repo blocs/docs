@@ -42,7 +42,9 @@ trait ExcelSetTrait
     {
         // シート番号（1始まり）またはシート名を位置に解決する
         $position = $this->resolveSheetPosition($sheetNo);
-        $position === false || $this->pendingSheetNames[$position] = $newSheetName;
+        if ($position !== false) {
+            $this->pendingSheetNames[$position] = $newSheetName;
+        }
 
         return $this;
     }
@@ -173,32 +175,35 @@ trait ExcelSetTrait
      */
     private function removeCalcChainPackageParts(): void
     {
-        $contentTypes = $this->loadWorksheetXml('[Content_Types].xml');
-        if ($contentTypes !== false) {
-            $overridesToRemove = [];
-            foreach ($contentTypes->Override as $override) {
-                if ((string) $override['PartName'] === '/xl/calcChain.xml') {
-                    $overridesToRemove[] = $override;
-                }
-            }
-            foreach ($overridesToRemove as $override) {
-                $domNode = dom_import_simplexml($override);
-                $domNode->parentNode->removeChild($domNode);
+        $this->removeMatchingSimpleXmlChildren(
+            $this->loadWorksheetXml('[Content_Types].xml'),
+            'Override',
+            fn ($override) => (string) $override['PartName'] === '/xl/calcChain.xml'
+        );
+
+        $this->removeMatchingSimpleXmlChildren(
+            $this->loadWorksheetXml('xl/_rels/workbook.xml.rels'),
+            'Relationship',
+            fn ($relationship) => str_ends_with((string) $relationship['Type'], '/relationships/calcChain')
+        );
+    }
+
+    private function removeMatchingSimpleXmlChildren($xml, string $childName, callable $shouldRemove): void
+    {
+        if ($xml === false) {
+            return;
+        }
+
+        $toRemove = [];
+        foreach ($xml->{$childName} as $node) {
+            if ($shouldRemove($node)) {
+                $toRemove[] = $node;
             }
         }
 
-        $workbookRels = $this->loadWorksheetXml('xl/_rels/workbook.xml.rels');
-        if ($workbookRels !== false) {
-            $relationshipsToRemove = [];
-            foreach ($workbookRels->Relationship as $relationship) {
-                if (str_ends_with((string) $relationship['Type'], '/relationships/calcChain')) {
-                    $relationshipsToRemove[] = $relationship;
-                }
-            }
-            foreach ($relationshipsToRemove as $relationship) {
-                $domNode = dom_import_simplexml($relationship);
-                $domNode->parentNode->removeChild($domNode);
-            }
+        foreach ($toRemove as $node) {
+            $domNode = dom_import_simplexml($node);
+            $domNode->parentNode->removeChild($domNode);
         }
     }
 
@@ -307,7 +312,7 @@ trait ExcelSetTrait
                     // 既存行の手前に挿入する追記行を書き出す
                     for ($r = $expectedRow; $r < $rowNum; $r++) {
                         if (! empty($pendingValues[(string) $r])) {
-                            fwrite($writer, $this->buildNewRowXml((string) $r, $pendingValues[(string) $r]));
+                            fwrite($writer, $this->applyValuesToRowXml('<row/>', (string) $r, $pendingValues[(string) $r]));
                         }
                     }
                     $expectedRow = $rowNum + 1;
@@ -366,7 +371,7 @@ trait ExcelSetTrait
 
         foreach ($rowKeys as $rowKey) {
             if ((int) $rowKey > $afterRow && ! empty($pendingValues[$rowKey])) {
-                fwrite($writer, $this->buildNewRowXml((string) $rowKey, $pendingValues[$rowKey]));
+                fwrite($writer, $this->applyValuesToRowXml('<row/>', (string) $rowKey, $pendingValues[$rowKey]));
             }
         }
     }
@@ -387,14 +392,6 @@ trait ExcelSetTrait
         }
 
         return $s;
-    }
-
-    /**
-     * 新規行のXMLを生成（既存行の編集と同じDOM処理を再利用する）
-     */
-    private function buildNewRowXml(string $rowName, array $cellValues): string
-    {
-        return $this->applyValuesToRowXml('<row/>', $rowName, $cellValues);
     }
 
     /**
@@ -463,6 +460,8 @@ trait ExcelSetTrait
 
         if (is_string($value)) {
             $value = $this->sanitizeXmlText($value);
+        } elseif (is_float($value) && ! is_finite($value)) {
+            $value = is_nan($value) ? 'NaN' : ($value > 0 ? 'INF' : '-INF');
         }
 
         if ($this->shouldStoreAsNumber($value)) {
@@ -522,9 +521,13 @@ trait ExcelSetTrait
      */
     private function sanitizeXmlText(string $value): string
     {
-        $sanitized = preg_replace('/[^\x{0009}\x{000A}\x{000D}\x{0020}-\x{D7FF}\x{E000}-\x{FFFD}]/u', '', $value);
+        if (! mb_check_encoding($value, 'UTF-8')) {
+            $value = mb_convert_encoding($value, 'UTF-8', 'UTF-8');
+        }
 
-        return is_string($sanitized) ? $sanitized : '';
+        $sanitized = preg_replace('/[^\x{0009}\x{000A}\x{000D}\x{0020}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u', '', $value);
+
+        return is_string($sanitized) ? $sanitized : $value;
     }
 
     private function loadSharedStrings()
@@ -568,8 +571,12 @@ trait ExcelSetTrait
      */
     private function shouldStoreAsNumber($value): bool
     {
-        if (is_int($value) || is_float($value)) {
+        if (is_int($value)) {
             return true;
+        }
+
+        if (is_float($value)) {
+            return is_finite($value);
         }
 
         if (! is_string($value) || ! is_numeric($value)) {
@@ -590,7 +597,10 @@ trait ExcelSetTrait
         // 共有文字列XMLへ新しい文字列を追加する（addChildは&をエスケープしないため事前に変換）
         foreach ($this->pendingSharedStrings as $value) {
             $addString = $sharedXml->addChild('si');
-            $addString->addChild('t', str_replace('&', '&amp;', $value));
+            $tNode = $addString->addChild('t', str_replace('&', '&amp;', $value));
+            if ($tNode && (string) $value !== trim((string) $value, " \t\n\r")) {
+                $tNode->addAttribute('xml:space', 'preserve', 'http://www.w3.org/XML/1998/namespace');
+            }
         }
 
         $this->worksheetXml[$this->sharedName] = $sharedXml;
