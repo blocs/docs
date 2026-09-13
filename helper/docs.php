@@ -42,9 +42,9 @@ if (! function_exists('docs')) {
         $backtrace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
 
         $GLOBALS['DOC_GENERATOR'][] = [
-            'path' => $backtrace[0]['file'],
-            'function' => $backtrace[1]['function'],
-            'line' => $backtrace[0]['line'],
+            'path' => $backtrace[0]['file'] ?? '',
+            'function' => $backtrace[1]['function'] ?? '',
+            'line' => $backtrace[0]['line'] ?? 0,
             'in' => $inputDocs,
             'process' => $processDocs,
             'out' => $outputDocs,
