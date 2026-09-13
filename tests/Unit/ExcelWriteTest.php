@@ -313,4 +313,56 @@ class ExcelWriteTest extends ExcelTestCase
         $this->assertSame('first', $result->get(1, 0, 0));
         $this->assertSame('second', $result->get(1, 1, 0));
     }
+
+    public function test_set_accepts_zero_padded_row_and_lowercase_column(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', 'old')),
+        ], []);
+
+        $excel = new Excel($path);
+        $excel->set(1, 'a', '01', 'NEW');
+        $generated = $this->generateToFile($excel);
+
+        $result = new Excel($generated);
+        $this->assertSame('NEW', $result->get(1, 'A', '1'));
+        $this->assertSame([['NEW']], $result->all(1));
+
+        $sheetXml = $this->zipEntry($generated, 'xl/worksheets/sheet1.xml');
+        $this->assertIsString($sheetXml);
+        $this->assertStringContainsString('r="A1"', $sheetXml);
+        $this->assertStringNotContainsString('r="a1"', $sheetXml);
+    }
+
+    public function test_shared_string_with_leading_space_sets_xml_space_preserve(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '1')),
+        ], []);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, '  spaced  ');
+        $generated = $this->generateToFile($excel);
+
+        $sharedXml = $this->zipEntry($generated, 'xl/sharedStrings.xml');
+        $this->assertIsString($sharedXml);
+        $this->assertStringContainsString('xml:space="preserve"', $sharedXml);
+        $this->assertStringContainsString('  spaced  ', $sharedXml);
+    }
+
+    public function test_non_finite_float_is_stored_as_shared_string(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '1')),
+        ], []);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, NAN);
+        $generated = $this->generateToFile($excel);
+
+        $sheetXml = $this->zipEntry($generated, 'xl/worksheets/sheet1.xml');
+        $this->assertIsString($sheetXml);
+        $this->assertStringNotContainsString('<v>NAN</v>', $sheetXml);
+        $this->assertStringContainsString('t="s"', $sheetXml);
+    }
 }

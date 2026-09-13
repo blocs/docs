@@ -356,4 +356,36 @@ class ExcelRegressionTest extends ExcelTestCase
         $result = new Excel($generated);
         $this->assertSame('ab', $result->get(1, 0, 0));
     }
+
+    public function test_set_keeps_supplementary_plane_characters(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::sharedCell('A1', 0)),
+        ], ['old']);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, '😀');
+        $excel->set(1, 1, 0, '𩸽');
+        $generated = $this->generateToFile($excel);
+
+        $result = new Excel($generated);
+        $this->assertSame('😀', $result->get(1, 0, 0));
+        $this->assertSame('𩸽', $result->get(1, 1, 0));
+    }
+
+    public function test_set_does_not_blank_invalid_utf8_strings(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::sharedCell('A1', 0)),
+        ], ['old']);
+
+        $excel = new Excel($path);
+        $excel->set(1, 0, 0, "ok\x80end");
+        $generated = $this->generateToFile($excel);
+
+        $result = new Excel($generated);
+        $this->assertNotSame('', $result->get(1, 0, 0));
+        $this->assertStringContainsString('ok', (string) $result->get(1, 0, 0));
+        $this->assertStringContainsString('end', (string) $result->get(1, 0, 0));
+    }
 }
