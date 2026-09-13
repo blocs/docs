@@ -49,6 +49,27 @@ class ExcelStreamTest extends ExcelTestCase
         $this->assertFalse($excel->first());
     }
 
+    public function test_row_after_blank_rows_is_not_skipped(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '1'))
+                .self::row(4, self::numCell('A4', '4'))
+                .self::row(5, self::numCell('A5', '5')),
+        ]);
+        $excel = new Excel($path);
+
+        $excel->open(1);
+
+        $rows = [];
+        while (($row = $excel->first()) !== false) {
+            $rows[] = $row;
+        }
+
+        // 空白行の直後の行が読み飛ばされないこと（all()と同じ結果になる）
+        $this->assertSame([['1'], [], [], ['4'], ['5']], $rows);
+        $this->assertSame($rows, (new Excel($path))->all(1));
+    }
+
     public function test_columns_filter(): void
     {
         $path = $this->buildXlsx([
@@ -103,5 +124,33 @@ class ExcelStreamTest extends ExcelTestCase
         $excel->open(1);
         $this->assertSame(['1'], $excel->first());
         $this->assertFalse($excel->first());
+    }
+
+    public function test_destructor_removes_temp_worksheet_when_path_contains_hash(): void
+    {
+        $dir = sys_get_temp_dir().DIRECTORY_SEPARATOR.'hash#'.uniqid('', true);
+        mkdir($dir);
+        $source = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::numCell('A1', '1')),
+        ]);
+        $path = $dir.DIRECTORY_SEPARATOR.'book.xlsx';
+        $this->assertTrue(copy($source, $path));
+
+        $compiled = (string) (config('view.compiled') ?? sys_get_temp_dir());
+        $before = glob($compiled.DIRECTORY_SEPARATOR.'excel*') ?: [];
+
+        $excel = new Excel($path);
+        $excel->open(1);
+        $this->assertSame(['1'], $excel->first());
+        unset($excel);
+        gc_collect_cycles();
+
+        $after = glob($compiled.DIRECTORY_SEPARATOR.'excel*') ?: [];
+        sort($before);
+        sort($after);
+        $this->assertSame($before, $after);
+
+        is_file($path) && unlink($path);
+        @rmdir($dir);
     }
 }

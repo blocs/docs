@@ -57,6 +57,11 @@ class Excel
         $this->templateLoaded = $this->excelTemplate->open($excelName) === true;
     }
 
+    public function __destruct()
+    {
+        $this->close();
+    }
+
     /**
      * 指定シートの指定セルの値を取得する
      *
@@ -169,11 +174,12 @@ class Excel
             $innerXml = $this->streamReader->readInnerXml();
 
             if ($this->streamExpectedRow < $rowNum) {
-                // 空白行を空配列で返しつつ、読み込んだ行は次回以降のために保持する
+                // 空白行を空配列で返しつつ、読み込んだ行は次回以降のために保持する。
+                // next()でリーダーを進めると、次のrow要素の内側から再開して
+                // その行を読み飛ばしてしまうため、位置は現在のrowのままにしておく
                 $this->streamPendingBlanks = $rowNum - $this->streamExpectedRow - 1;
                 $this->streamPendingRow = $this->parseStreamRow($innerXml, $rowNum);
                 $this->streamExpectedRow = $rowNum + 1;
-                $this->streamReader->next();
 
                 return [];
             }
@@ -224,7 +230,8 @@ class Excel
     }
 
     /**
-     * generate() 後に閉じた Zip を、必要なら元ファイルから開き直す
+     * generate() 後に閉じた Zip を、必要なら元ファイルから開き直す。
+     * set() / name() で積んだ保留値は破棄しない（generate() 前の開き直しで指定が消えないように）。
      */
     private function ensureTemplateLoaded(): bool
     {
@@ -232,15 +239,6 @@ class Excel
             return true;
         }
 
-        return $this->reopenTemplate();
-    }
-
-    /**
-     * テンプレート Zip を開き直す。
-     * set() / name() で積んだ保留値は破棄しない（generate() 前の開き直しで指定が消えないように）。
-     */
-    private function reopenTemplate(): bool
-    {
         $this->excelTemplate = new \ZipArchive;
         $this->templateLoaded = is_file($this->excelName) && $this->excelTemplate->open($this->excelName) === true;
         $this->resetReadCaches();
@@ -290,13 +288,16 @@ class Excel
         return $sheetName;
     }
 
-    private function parseStreamRow(string $innerXml, int $rowNumber): array
+    private function parseStreamRow(string $innerXml, int $rowNumber, ?array $columnsSet = null): array
     {
         if ($innerXml === '') {
             return [];
         }
 
-        return $this->cellsToRowData($this->parseRowCells($innerXml, false, $rowNumber), $this->streamColumnsSet);
+        $cells = $this->parseRowCellMaps($innerXml, $rowNumber)['values'];
+        uksort($cells, fn ($a, $b) => $this->columnNameToIndex($a) <=> $this->columnNameToIndex($b));
+
+        return $this->cellsToRowData($cells, $columnsSet ?? $this->streamColumnsSet);
     }
 
     /**
@@ -361,11 +362,7 @@ class Excel
             }
 
             $innerXml = $reader->readInnerXml();
-            $rowData = $innerXml === ''
-                ? []
-                : $this->cellsToRowData($this->parseRowCells($innerXml, false, $rowNum), $columnsSet);
-
-            $rowCallback($rowData, $rowNum);
+            $rowCallback($this->parseStreamRow($innerXml, $rowNum, $columnsSet), $rowNum);
             $expectedRow = $rowNum + 1;
         }
 
@@ -401,6 +398,7 @@ class Excel
         }
 
         $cache = ['values' => [], 'formulas' => []];
+        $this->sharedFormulasCache[$sheetName] = [];
 
         $tempName = $this->loadWorksheetFile($sheetName);
         if (! $tempName) {
@@ -425,11 +423,15 @@ class Excel
                 continue;
             }
 
-            foreach ($this->parseRowCellsWithReader($innerXml, false, $rowNum) as $ref => $value) {
+            $parsed = $this->parseRowCellMaps($innerXml, $rowNum);
+            foreach ($parsed['values'] as $ref => $value) {
                 $cache['values'][$ref] = $value;
             }
-            foreach ($this->parseRowCellsWithReader($innerXml, true, $rowNum) as $ref => $value) {
+            foreach ($parsed['formulas'] as $ref => $value) {
                 $cache['formulas'][$ref] = $value;
+            }
+            foreach ($parsed['sharedMasters'] as $sharedIndex => $master) {
+                isset($this->sharedFormulasCache[$sheetName][$sharedIndex]) || $this->sharedFormulasCache[$sheetName][$sharedIndex] = $master;
             }
         }
 
@@ -446,64 +448,13 @@ class Excel
      */
     private function resolveSharedFormula(string $sheetName, int $sharedIndex, string $cellName): string
     {
-        $master = $this->loadSharedFormulas($sheetName)[$sharedIndex] ?? null;
+        $this->loadSheetCells($sheetName);
+        $master = $this->sharedFormulasCache[$sheetName][$sharedIndex] ?? null;
         if ($master === null) {
             return '';
         }
 
         return $this->translateFormulaReferences($master['formula'], $master['cell'], $cellName);
-    }
-
-    /**
-     * シート内の共有数式マスター（式本体を持つ<f t="shared">）を収集する
-     * メンバーセルの式取得時のみ遅延実行し、シート毎にキャッシュする
-     *
-     * @return array<int, array{cell: string, formula: string}> si => マスターセルと式
-     */
-    private function loadSharedFormulas(string $sheetName): array
-    {
-        if (isset($this->sharedFormulasCache[$sheetName])) {
-            return $this->sharedFormulasCache[$sheetName];
-        }
-
-        $this->sharedFormulasCache[$sheetName] = [];
-
-        $tempName = $this->loadWorksheetFile($sheetName);
-        if (! $tempName) {
-            return $this->sharedFormulasCache[$sheetName];
-        }
-
-        $reader = new XMLReader;
-        $reader->open($tempName);
-
-        $currentCell = '';
-        while ($reader->read()) {
-            if ($reader->nodeType !== XMLReader::ELEMENT) {
-                continue;
-            }
-
-            if ($reader->localName === 'c') {
-                $currentCell = $reader->getAttribute('r') ?? '';
-
-                continue;
-            }
-
-            if ($reader->localName !== 'f' || $reader->isEmptyElement
-                || $reader->getAttribute('t') !== 'shared' || $currentCell === '') {
-                continue;
-            }
-
-            $sharedIndex = (int) $reader->getAttribute('si');
-            $formula = $reader->readString();
-            if ($formula !== '' && ! isset($this->sharedFormulasCache[$sheetName][$sharedIndex])) {
-                $this->sharedFormulasCache[$sheetName][$sharedIndex] = ['cell' => $currentCell, 'formula' => $formula];
-            }
-        }
-
-        $reader->close();
-        is_file($tempName) && unlink($tempName);
-
-        return $this->sharedFormulasCache[$sheetName];
     }
 
     /**
@@ -550,22 +501,13 @@ class Excel
     }
 
     /**
-     * 行のXMLからセル参照と値を抽出（共有文字列は解決済みで返す）
-     *
-     * @param  bool  $preferFormula  trueの場合、式があるセルは式（共有数式メンバーはマーカー配列）を返す
-     * @param  int  $rowNumber  行番号（r属性のないセルの参照補完に使用）
+     * @return array{values: array<string, mixed>, formulas: array<string, mixed>, sharedMasters: array<int, array{cell: string, formula: string}>}
      */
-    private function parseRowCells(string $innerXml, bool $preferFormula, int $rowNumber): array
+    private function parseRowCellMaps(string $innerXml, int $rowNumber): array
     {
-        $cells = $this->parseRowCellsWithReader($innerXml, $preferFormula, $rowNumber);
-        uksort($cells, fn ($a, $b) => $this->columnNameToIndex($a) <=> $this->columnNameToIndex($b));
-
-        return $cells;
-    }
-
-    private function parseRowCellsWithReader(string $innerXml, bool $preferFormula, int $rowNumber): array
-    {
-        $cells = [];
+        $values = [];
+        $formulas = [];
+        $sharedMasters = [];
         $nextColumnIndex = 0;
         $subReader = new XMLReader;
         $subReader->XML('<row xmlns="'.self::MAIN_NS.'">'.$innerXml.'</row>');
@@ -619,21 +561,21 @@ class Excel
                 $value = $this->normalizeNumericCellValue($value);
             }
 
-            if ($preferFormula) {
-                if ($formula === '' && $sharedFormulaIndex !== null) {
-                    // 共有数式のメンバーセルは式を持たないため、呼び出し元でマスター式から解決する
-                    $value = ['sharedFormulaIndex' => $sharedFormulaIndex];
-                } else {
-                    $value = $formula;
-                }
+            $values[$ref] = $value;
+            if ($formula === '' && $sharedFormulaIndex !== null) {
+                $formulas[$ref] = ['sharedFormulaIndex' => $sharedFormulaIndex];
+            } else {
+                $formulas[$ref] = $formula;
             }
 
-            $cells[$ref] = $value;
+            if ($sharedFormulaIndex !== null && $formula !== '' && ! isset($sharedMasters[$sharedFormulaIndex])) {
+                $sharedMasters[$sharedFormulaIndex] = ['cell' => $ref, 'formula' => $formula];
+            }
         }
 
         $subReader->close();
 
-        return $cells;
+        return compact('values', 'formulas', 'sharedMasters');
     }
 
     /**
@@ -902,9 +844,17 @@ class Excel
     private function normalizeCoordinate($sheetColumn, $sheetRow)
     {
         is_int($sheetColumn) && $sheetColumn = $this->resolveColumnName($sheetColumn);
-        is_int($sheetRow) && $sheetRow = $sheetRow + 1;
+        if (is_string($sheetColumn)) {
+            $sheetColumn = strtoupper($sheetColumn);
+        }
 
-        return [$sheetColumn, (string) $sheetRow];
+        if (is_int($sheetRow)) {
+            $sheetRow = $sheetRow + 1;
+        } elseif (is_numeric($sheetRow)) {
+            $sheetRow = (int) $sheetRow;
+        }
+
+        return [(string) $sheetColumn, (string) $sheetRow];
     }
 
     private function columnNameToIndex(string $cellRef): int
