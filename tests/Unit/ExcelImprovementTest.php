@@ -129,7 +129,7 @@ class ExcelImprovementTest extends ExcelTestCase
     {
         $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []);
 
-        foreach ([['A', '0'], ['B2', '3'], [-1, 0], ['A', -1], ['XFE', '1'], ['A', '1048577'], ['', '1'], ['A', '1.5']] as [$column, $row]) {
+        foreach ([['A', '0'], ['B2', '3'], [-1, 0], ['A', -1], ['XFE', '1'], ['A', '1048577'], ['', '1'], ['A', 'x'], ['A', null]] as [$column, $row]) {
             $excel = new Excel($path);
 
             // 読み取りは見つからない扱い
@@ -148,6 +148,143 @@ class ExcelImprovementTest extends ExcelTestCase
         $excel = new Excel($path);
         $excel->set(1, 'xfd', '1048576', 'edge');
         $this->assertSame('edge', (new Excel($this->generateToFile($excel)))->get(1, 'XFD', '1048576'));
+    }
+
+    public function test_row_accepts_numeric_values_other_than_int_as_one_based(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1')).self::row(2, self::numCell('A2', '2'))], []);
+        $excel = new Excel($path);
+
+        // int は0始まり。それ以外の数値（文字列・float など）は、従来どおり1始まりの行番号
+        $this->assertSame('2', $excel->get(1, 'A', 1));
+        foreach (['2', 2.0, '2.0', ' 2', '+2', '02'] as $row) {
+            $this->assertSame('2', $excel->get(1, 'A', $row), var_export($row, true));
+        }
+
+        $excel->set(1, 'B', 2.0, 'float-row');
+        $this->assertSame('float-row', (new Excel($this->generateToFile($excel)))->get(1, 'B', '2'));
+    }
+
+    public function test_path_with_spaces_and_non_ascii_characters(): void
+    {
+        $source = $this->buildXlsx([
+            'One' => self::row(1, self::sharedCell('A1', 0).self::numCell('B1', '2')),
+            '二枚目' => self::row(1, self::sharedCell('A1', 1)),
+        ], ['text', 'second']);
+
+        $directory = sys_get_temp_dir().'/blocs docs 日本語 [1]-'.bin2hex(random_bytes(4));
+        mkdir($directory);
+        $path = $directory.'/売上 2024.xlsx';
+        copy($source, $path);
+
+        try {
+            // 警告を例外に変換する環境（Laravel）と同じ条件で確かめる
+            set_error_handler(function (int $errno, string $message): bool {
+                if (! (error_reporting() & $errno)) {
+                    return false;
+                }
+
+                throw new \ErrorException($message);
+            });
+
+            $excel = new Excel($path);
+            $this->assertSame(['One', '二枚目'], $excel->sheetNames());
+            $this->assertSame([['text', '2']], $excel->all(1));
+            $this->assertSame('second', $excel->get('二枚目', 'A', '1'));
+
+            $excel->open('One');
+            $this->assertSame(['text', '2'], $excel->first());
+            $excel->close();
+
+            // 書き込んでも、既存の共有文字列を失わない
+            $excel->set('二枚目', 'B', '1', 'added')->name(1, 'Renamed');
+            $this->assertTrue($excel->save());
+
+            $result = new Excel($path);
+            $this->assertSame(['Renamed', '二枚目'], $result->sheetNames());
+            $this->assertSame([['text', '2']], $result->all(1));
+            $this->assertSame([['second', 'added']], $result->all(2));
+        } finally {
+            restore_error_handler();
+            // ディレクトリ名に [ ] があるので、glob ではなく scandir で片付ける
+            foreach (array_diff(scandir($directory), ['.', '..']) as $fileName) {
+                unlink($directory.'/'.$fileName);
+            }
+            rmdir($directory);
+        }
+    }
+
+    public function test_unreadable_file_returns_false_or_empty_without_error(): void
+    {
+        $excel = new Excel(sys_get_temp_dir().'/blocs-docs-missing-'.bin2hex(random_bytes(4)).'.xlsx');
+
+        $this->assertSame([], $excel->sheetNames());
+        $this->assertFalse($excel->get(1, 'A', '1'));
+        $this->assertFalse($excel->all(1));
+        $this->assertFalse($excel->set(1, 'A', '1', 'x'));
+        $this->assertSame($excel, $excel->name(1, 'x'));
+        $this->assertSame($excel, $excel->name('Sheet1', 'x'));
+        $this->assertFalse($excel->generate());
+        $this->assertFalse($excel->save($this->tempFile()));
+
+        // 生成後に読み込み元がなくなった場合も同じ
+        $path = $this->buildXlsx(['Sheet1' => ''], []);
+        $excel = new Excel($path);
+        $excel->generate();
+        unlink($path);
+        $this->assertSame($excel, $excel->name(1, 'x'));
+        $this->assertFalse($excel->generate());
+    }
+
+    public function test_save_does_not_replace_read_only_file_and_follows_dangling_symlink(): void
+    {
+        $source = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []);
+
+        // 書き込み禁止のファイルは置き換えない
+        $readOnly = $this->tempFile();
+        copy($source, $readOnly);
+        chmod($readOnly, 0444);
+        $before = md5_file($readOnly);
+
+        $excel = new Excel($source);
+        $excel->set(1, 'A', '1', 5);
+
+        // root（Docker など）はパーミッションに関係なく書き込めるので、書き込み禁止の確認はできない
+        clearstatcache();
+        if (! is_writable($readOnly)) {
+            $this->assertFalse($excel->save($readOnly));
+            clearstatcache();
+            $this->assertSame($before, md5_file($readOnly));
+            $this->assertSame(0444, fileperms($readOnly) & 0777);
+        }
+        chmod($readOnly, 0644);
+
+        // 保存できなかった編集内容は残っていて、別の場所へ保存し直せる
+        $directory = sys_get_temp_dir().'/blocs-docs-link-'.bin2hex(random_bytes(4));
+        mkdir($directory);
+        $linkTarget = $directory.'/real.xlsx';
+        $linkPath = $directory.'/link.xlsx';
+        symlink($linkTarget, $linkPath);
+
+        try {
+            // リンク先がまだないシンボリックリンクは、リンク先に作る
+            $this->assertTrue($excel->save($linkPath));
+            clearstatcache();
+            $this->assertTrue(is_link($linkPath));
+            $this->assertSame('5', (new Excel($linkTarget))->get(1, 'A', '1'));
+            $this->assertSame([], glob($directory.'/.*.tmp'));
+        } finally {
+            array_map('unlink', array_filter([$linkPath, $linkTarget], fn ($file) => is_link($file) || is_file($file)));
+            rmdir($directory);
+        }
+    }
+
+    public function test_numeric_value_just_below_power_of_ten_keeps_its_digits(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '99999999999999.9').self::numCell('B1', '999.5').self::numCell('C1', '9.99999'))]);
+
+        // 整数部の桁数を多く数えて、小数を丸めてしまわない
+        $this->assertSame([['99999999999999.9', '999.5', '9.99999']], (new Excel($path))->all(1));
     }
 
     public function test_value_types(): void
@@ -642,7 +779,7 @@ class ExcelImprovementTest extends ExcelTestCase
         $this->assertSame('5', (new Excel($this->generateToFile($excel)))->get(1, 'A', '1'));
     }
 
-    public function test_non_worksheet_part_is_left_untouched(): void
+    public function test_set_on_non_worksheet_part_fails_instead_of_being_ignored(): void
     {
         $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []);
 
@@ -656,7 +793,438 @@ class ExcelImprovementTest extends ExcelTestCase
         $excel = new Excel($path);
         $excel->set(1, 'A', '1', 5);
 
-        // ワークシートでないパートは編集せず、そのまま出力する
-        $this->assertSame($chartsheet, $this->zipEntry($this->generateToFile($excel), 'xl/worksheets/sheet1.xml'));
+        // ワークシートでないパートには値を書き込めない。指定を黙って捨てたファイルは出力せず、失敗にする
+        $this->assertFalse($excel->generate());
+        $this->assertFalse($excel->save($this->tempFile()));
+
+        // 編集をしなければ、そのまま出力できる
+        $untouched = $this->tempFile();
+        $this->assertTrue((new Excel($path))->save($untouched));
+        $this->assertSame($chartsheet, $this->zipEntry($untouched, 'xl/worksheets/sheet1.xml'));
+    }
+
+    public function test_stream_survives_save_over_the_loaded_file(): void
+    {
+        $rows = '';
+        for ($rowNumber = 1; $rowNumber <= 3000; $rowNumber++) {
+            $rows .= self::row($rowNumber, self::numCell('A'.$rowNumber, (string) $rowNumber).self::numCell('B'.$rowNumber, '1'));
+        }
+        $path = $this->buildXlsx(['Sheet1' => $rows], []);
+
+        $excel = new Excel($path);
+        $excel->open(1);
+        $this->assertSame(['1', '1'], $excel->first());
+
+        // 読んでいる途中で、読み込み元を上書き保存する
+        $excel->set(1, 'B', '1', 'changed');
+        $this->assertTrue($excel->save());
+
+        // 読みかけのストリームは、最後まで（壊れずに）読める
+        $count = 1;
+        $last = null;
+        while (($row = $excel->next()) !== false) {
+            $count++;
+            $last = $row;
+        }
+        $this->assertSame(3000, $count);
+        $this->assertSame(['3000', '1'], $last);
+
+        // 保存した内容は新しく読めば見える。保存先のディレクトリに一時ファイルを残さない
+        $this->assertSame('changed', (new Excel($path))->get(1, 'B', '1'));
+        $this->assertSame([], glob(dirname($path).'/.'.basename($path).'.*.tmp'));
+    }
+
+    public function test_defined_name_quotes_sheet_names_that_look_like_cell_references(): void
+    {
+        foreach (['A1' => "'A1'", 'api2' => "'api2'", 'R1C1' => "'R1C1'", 'TRUE' => "'TRUE'", 'Report' => 'Report', '集計' => '集計'] as $newName => $expectedReference) {
+            $path = $this->buildXlsx(['Sheet1' => ''], []);
+
+            $zip = new \ZipArchive;
+            $zip->open($path);
+            $zip->addFromString('xl/workbook.xml', str_replace(
+                '</sheets>',
+                '</sheets><definedNames><definedName name="x">Sheet1!$A$1</definedName></definedNames>',
+                $zip->getFromName('xl/workbook.xml')
+            ));
+            $zip->close();
+
+            $excel = new Excel($path);
+            $excel->name(1, (string) $newName);
+            $definedName = simplexml_load_string($this->zipEntry($this->generateToFile($excel), 'xl/workbook.xml'))->definedNames->definedName;
+
+            $this->assertSame($expectedReference.'!$A$1', (string) $definedName);
+        }
+    }
+
+    public function test_dates_before_1900_are_written_as_text(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => ''], []);
+        $excel = new Excel($path);
+        $excel->set(1, 'A', '1', new \DateTime('1899-12-31 00:00:00'))->set(1, 'B', '1', new \DateTime('1900-01-01'));
+
+        // エクセルの日時として表せない日付は、文字列で書き込む
+        $this->assertSame([['1899-12-31 00:00:00', '1']], (new Excel($this->generateToFile($excel)))->all(1));
+    }
+
+    public function test_relative_path_keeps_pointing_to_the_same_file_after_chdir(): void
+    {
+        $directory = sys_get_temp_dir().'/blocs-docs-rel-'.bin2hex(random_bytes(4));
+        mkdir($directory.'/other', 0755, true);
+        copy($this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []), $directory.'/data.xlsx');
+        // カレントディレクトリを変えた先に、同じ名前の別のファイルがある
+        copy($this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '999'))], []), $directory.'/other/data.xlsx');
+
+        $workingDirectory = getcwd();
+        chdir($directory);
+
+        try {
+            $excel = new Excel('data.xlsx');
+            chdir($directory.'/other');
+
+            // 開いたときのファイルを読み続ける
+            $this->assertSame('1', $excel->get(1, 'A', '1'));
+            $this->assertSame([['1']], $excel->all(1));
+
+            // 生成後の開き直しと、引数なしの保存も、開いたときのファイルが対象
+            $excel->set(1, 'B', '1', 2);
+            $this->assertNotFalse($excel->generate());
+            $this->assertSame([['1']], $excel->all(1));
+            $this->assertTrue($excel->save());
+
+            $this->assertSame([['1', '2']], (new Excel($directory.'/data.xlsx'))->all(1));
+            $this->assertSame([['999']], (new Excel($directory.'/other/data.xlsx'))->all(1));
+
+            // 相対パスへの保存は、従来どおり保存時のカレントディレクトリが基準
+            $this->assertTrue($excel->save('out.xlsx'));
+            $this->assertFileExists($directory.'/other/out.xlsx');
+        } finally {
+            chdir($workingDirectory);
+            array_map('unlink', array_filter([$directory.'/data.xlsx', $directory.'/other/data.xlsx', $directory.'/other/out.xlsx'], 'is_file'));
+            rmdir($directory.'/other');
+            rmdir($directory);
+        }
+    }
+
+    public function test_open_treats_non_array_columns_as_no_filter(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1').self::numCell('B1', '2'))], []);
+        $excel = new Excel($path);
+
+        // v2.0.16 と同じく、配列以外は「列の指定なし」
+        foreach ([null, false, 0, ''] as $columns) {
+            $excel->open(1, $columns);
+            $this->assertSame(['1', '2'], $excel->first(), var_export($columns, true));
+        }
+    }
+
+    public function test_stringable_column_and_row(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(2, self::numCell('B2', '5'))], []);
+        $stringable = fn (string $value) => new class($value) implements \Stringable
+        {
+            public function __construct(private string $value) {}
+
+            public function __toString(): string
+            {
+                return $this->value;
+            }
+        };
+
+        $excel = new Excel($path);
+        $this->assertSame('5', $excel->get(1, $stringable('B'), $stringable('2')));
+        $excel->set(1, $stringable('C'), $stringable('2'), 6);
+        $this->assertSame('6', (new Excel($this->generateToFile($excel)))->get(1, 'C', '2'));
+    }
+
+    public function test_save_with_invalid_file_name_leaves_no_temporary_file(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => ''], []);
+        $countTemporaryFiles = fn () => count(glob(sys_get_temp_dir().'/excel*'));
+        $before = $countTemporaryFiles();
+
+        $excel = new Excel($path);
+        try {
+            $excel->save([]);
+            $this->fail('例外になりませんでした');
+        } catch (\InvalidArgumentException) {
+        }
+
+        $this->assertSame($before, $countTemporaryFiles());
+    }
+
+    public function test_save_to_long_file_name(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []);
+
+        // ファイル名の上限（255バイト）に近い名前でも保存できる（一時ファイル名を保存先の名前から作らない）
+        $longName = sys_get_temp_dir().'/'.str_repeat('a', 240).'.xlsx';
+        try {
+            $this->assertTrue((new Excel($path))->save($longName));
+            $this->assertSame('1', (new Excel($longName))->get(1, 'A', '1'));
+        } finally {
+            is_file($longName) && unlink($longName);
+        }
+    }
+
+    public function test_save_to_stream_wrapper(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []);
+        $excel = new Excel($path);
+        $excel->set(1, 'A', '1', 7);
+
+        // php://output のようなストリームラッパーにも保存できる
+        ob_start();
+        try {
+            $saved = $excel->save('php://output');
+        } finally {
+            $contents = ob_get_clean();
+        }
+        $this->assertTrue($saved);
+
+        $copy = tempnam(sys_get_temp_dir(), 'blocs-test');
+        try {
+            file_put_contents($copy, $contents);
+            $this->assertSame('7', (new Excel($copy))->get(1, 'A', '1'));
+        } finally {
+            unlink($copy);
+        }
+    }
+
+    public function test_instance_recovers_after_duplicate_sheet_name(): void
+    {
+        $path = $this->buildXlsx(['One' => self::row(1, self::numCell('A1', '1')), 'Two' => ''], []);
+        $excel = new Excel($path);
+        $excel->set(1, 'A', '1', 5)->name(1, 'two');
+
+        try {
+            $excel->generate();
+            $this->fail('例外になりませんでした');
+        } catch (\InvalidArgumentException) {
+        }
+
+        // 重複した名前の指定は破棄される。値の指定は残っていて、そのまま生成できる
+        $result = new Excel($this->generateToFile($excel));
+        $this->assertSame(['One', 'Two'], $result->sheetNames());
+        $this->assertSame('5', $result->get(1, 'A', '1'));
+    }
+
+    public function test_strict_open_xml_workbook_is_readable_by_sheet_name(): void
+    {
+        $path = $this->buildXlsx([
+            'One' => self::row(1, self::sharedCell('A1', 0)),
+            'Two' => self::row(1, self::numCell('A1', '2')),
+        ], ['text']);
+
+        // 名前空間を Strict Open XML 形式のURIに置き換える
+        $zip = new \ZipArchive;
+        $zip->open($path);
+        foreach (['xl/workbook.xml', 'xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml', 'xl/sharedStrings.xml'] as $entryName) {
+            $zip->addFromString($entryName, str_replace(
+                [self::MAIN_NS, 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'],
+                ['http://purl.oclc.org/ooxml/spreadsheetml/main', 'http://purl.oclc.org/ooxml/officeDocument/relationships'],
+                $zip->getFromName($entryName)
+            ));
+        }
+        $zip->close();
+
+        // 読み取りは、番号でも名前でもできる
+        $excel = new Excel($path);
+        $this->assertSame(['One', 'Two'], $excel->sheetNames());
+        $this->assertSame([['text']], $excel->all('One'));
+        $this->assertSame('2', $excel->get('Two', 'A', '1'));
+
+        // 書き込みには対応していない。指定を黙って捨てず、失敗にする
+        $excel->set('Two', 'B', '1', 'x');
+        $this->assertFalse($excel->generate());
+    }
+
+    public function test_all_and_get_keep_reading_the_content_loaded_at_first(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, self::sharedCell('A1', 0).self::sharedCell('B1', 1)),
+        ], ['aaa', 'bbb']);
+
+        $reader = new Excel($path);
+        $this->assertSame([['aaa', 'bbb']], $reader->all(1));
+
+        // 別のインスタンスが、文字列の並びが変わる内容で同じファイルを保存する
+        $writer = new Excel($path);
+        $writer->set(1, 'A', '1', 'zzz')->set(1, 'C', '1', 'ccc');
+        $this->assertTrue($writer->save());
+
+        // 読み込み済みのインスタンスは、シートと共有文字列で新旧が混ざった内容（文字列の番号など）を返さない
+        $this->assertSame([['aaa', 'bbb']], $reader->all(1));
+        $this->assertSame('bbb', $reader->get(1, 'B', '1'));
+
+        // 新しく開けば、保存後の内容が読める
+        $this->assertSame([['zzz', 'bbb', 'ccc']], (new Excel($path))->all(1));
+    }
+
+    public function test_generate_works_when_temp_directory_is_outside_open_basedir(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, self::numCell('A1', '1'))], []);
+
+        // 一時ディレクトリが open_basedir の外にあり、view.compiled だけが使える環境を、子プロセスで再現する
+        // （open_basedir は一度設定すると戻せず、PHPUnit 自身も一時ディレクトリを使うため）
+        $allowed = dirname($path).'/blocs-docs-basedir-'.bin2hex(random_bytes(4));
+        mkdir($allowed);
+        copy($path, $allowed.'/book.xlsx');
+
+        $packageRoot = dirname(__DIR__, 2);
+        $autoload = null;
+        foreach ([$packageRoot.'/vendor/autoload.php', dirname($packageRoot, 2).'/autoload.php'] as $candidate) {
+            is_file($candidate) && $autoload ??= $candidate;
+        }
+
+        $script = <<<'PHP'
+<?php
+[$self, $autoload, $allowed, $source] = $argv;
+require $autoload;
+require_once $source.'/Excel.php';
+\Illuminate\Container\Container::getInstance()->instance('config', new \Illuminate\Config\Repository(['view' => ['compiled' => $allowed]]));
+// 警告を例外に変換する（Laravel と同じ）
+set_error_handler(function (int $errno, string $message): bool {
+    if (! (error_reporting() & $errno)) {
+        return false;
+    }
+    throw new \ErrorException($message);
+});
+ini_set('open_basedir', $allowed.PATH_SEPARATOR.dirname($autoload, 2));
+$excel = new \Blocs\Excel($allowed.'/book.xlsx');
+$excel->set(1, 'B', '1', 2);
+echo json_encode([$excel->save($allowed.'/out.xlsx'), (new \Blocs\Excel($allowed.'/out.xlsx'))->all(1), strlen((string) $excel->generate()) > 0]);
+PHP;
+        file_put_contents($allowed.'/run.php', $script);
+
+        try {
+            $output = [];
+            exec(escapeshellarg(PHP_BINARY).' '.implode(' ', array_map('escapeshellarg', [$allowed.'/run.php', (string) $autoload, $allowed, $packageRoot.'/src'])).' 2>&1', $output);
+
+            $this->assertSame('[true,[["1","2"]],true]', implode("\n", $output));
+        } finally {
+            foreach (array_diff(scandir($allowed), ['.', '..']) as $fileName) {
+                unlink($allowed.'/'.$fileName);
+            }
+            rmdir($allowed);
+        }
+    }
+
+    public function test_generate_does_not_mix_file_changed_after_loading(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, '<c r="A1" t="s"><v>0</v></c>')], ['hello']);
+        $first = new Excel($path);
+        $first->get(1, 'A', '1');
+
+        // 読み込んだ後に、別の処理が同じファイルを書き換える
+        $second = new Excel($path);
+        $second->set(1, 'A', '1', 'other')->save();
+
+        $first->set(1, 'B', '1', 'mine');
+        $result = new Excel($this->generateToFile($first));
+
+        // 書き換えた覚えのない A1 が、別のセルの値になることはない
+        $this->assertSame('hello', $result->get(1, 'A', '1'));
+        $this->assertSame('mine', $result->get(1, 'B', '1'));
+    }
+
+    public function test_dimension_is_expanded_for_cells_outside_of_it(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => [
+            'pre' => '<dimension ref="B2:C3"/>',
+            'rows' => self::row(2, self::numCell('B2', '1')).self::row(3, self::numCell('C3', '2')),
+        ]], []);
+
+        $inside = new Excel($path);
+        $inside->set(1, 'C', '2', 5);
+        $this->assertStringContainsString(' ref="B2:C3"/>', $this->zipEntry($this->generateToFile($inside), 'xl/worksheets/sheet1.xml'));
+
+        $outside = new Excel($path);
+        $outside->set(1, 'A', '1', 5)->set(1, 'AA', '12', 'x');
+        $this->assertStringContainsString(' ref="A1:AA12"/>', $this->zipEntry($this->generateToFile($outside), 'xl/worksheets/sheet1.xml'));
+    }
+
+    public function test_shared_strings_count_without_count_attributes(): void
+    {
+        $path = $this->buildXlsx(['Sheet1' => self::row(1, '<c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c>')], ['a', 'b']);
+        $zip = new \ZipArchive;
+        $zip->open($path);
+        $zip->addFromString('xl/sharedStrings.xml', preg_replace('/ count="2" uniqueCount="2"/', '', $zip->getFromName('xl/sharedStrings.xml')));
+        $zip->close();
+
+        $excel = new Excel($path);
+        $excel->set(1, 'C', '1', 'c')->set(1, 'D', '1', 'd')->set(1, 'E', '1', 'a');
+        $sharedStrings = simplexml_load_string($this->zipEntry($this->generateToFile($excel), 'xl/sharedStrings.xml'));
+
+        // 件数の属性がないファイルでも、実際の文字列の数と一致する
+        $this->assertCount(4, $sharedStrings->si);
+        $this->assertSame('4', (string) $sharedStrings['uniqueCount']);
+        $this->assertSame('4', (string) $sharedStrings['count']);
+    }
+
+    public function test_shared_formula_translates_whole_column_and_row_references(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(7, '<c r="A7"><f t="shared" ref="A7:B8" si="0">SUM(A:A)+SUM($C:D)+SUM(1:1)+SUM($3:4)+XFD1+A1048576+Tax.A1</f><v>0</v></c><c r="B7"><f t="shared" si="0"/><v>0</v></c>')
+                .self::row(8, '<c r="A8"><f t="shared" si="0"/><v>0</v></c>'),
+        ], []);
+
+        // 列全体・行全体の参照も移動し、シートの範囲外に出る参照は #REF! になる
+        $excel = new Excel($path);
+        $this->assertSame('SUM(B:B)+SUM($C:E)+SUM(1:1)+SUM($3:4)+#REF!+B1048576+Tax.A1', $excel->get(1, 'B', '7', true));
+        $this->assertSame('SUM(A:A)+SUM($C:D)+SUM(2:2)+SUM($3:5)+XFD2+#REF!+Tax.A1', $excel->get(1, 'A', '8', true));
+
+        // マスターを上書きして展開した数式も同じ
+        $excel->set(1, 'A', '7', 99);
+        $result = new Excel($this->generateToFile($excel));
+        $this->assertSame('SUM(B:B)+SUM($C:E)+SUM(1:1)+SUM($3:4)+#REF!+B1048576+Tax.A1', $result->get(1, 'B', '7', true));
+        $this->assertSame('SUM(A:A)+SUM($C:D)+SUM(2:2)+SUM($3:5)+XFD2+#REF!+Tax.A1', $result->get(1, 'A', '8', true));
+    }
+
+    public function test_cdata_text_is_read_without_markup(): void
+    {
+        $path = $this->buildXlsx([
+            'Sheet1' => self::row(1, '<c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t><![CDATA[x<y>&z]]></t></is></c><c r="C1" t="s"><v>1</v></c>'),
+        ], ['<si><t><![CDATA[c<d>&a]]></t></si>', '<si><r><t>a&amp;</t></r><r><t><![CDATA[&amp;</t>]]></t></r></si>']);
+
+        $excel = new Excel($path);
+        $this->assertSame('c<d>&a', $excel->get(1, 'A', '1'));
+        $this->assertSame(['c<d>&a', 'x<y>&z', 'a&&amp;</t>'], $excel->all(1)[0]);
+
+        // 既存の文字列として見つかり、追加されない
+        $excel->set(1, 'D', '1', 'c<d>&a');
+        $generated = $this->generateToFile($excel);
+        $this->assertCount(2, simplexml_load_string($this->zipEntry($generated, 'xl/sharedStrings.xml'))->si);
+        $this->assertSame('c<d>&a', (new Excel($generated))->get(1, 'D', '1'));
+    }
+
+    public function test_defined_names_follow_renames_in_3d_and_case_insensitive_references(): void
+    {
+        $path = $this->buildXlsx(['Alpha' => '', 'Mid' => '', 'Omega' => ''], []);
+        $zip = new \ZipArchive;
+        $zip->open($path);
+        $zip->addFromString('xl/workbook.xml', str_replace(
+            '</sheets>',
+            '</sheets><definedNames>'
+                .'<definedName name="a">SUM(Alpha:Omega!A1)+SUM(Mid:Alpha!B2)</definedName>'
+                .'<definedName name="b">alpha!$A$1+\'ALPHA\'!$A$2+\'alpha:omega\'!A1</definedName>'
+                .'<definedName name="c">Alpha!A1:Alpha!B2+Mid!A1:Omega!B2</definedName>'
+                .'<definedName name="d">\'C:\\dir\\[book.xlsx]Alpha\'!A1+[1]Alpha!A1</definedName>'
+                .'</definedNames>',
+            $zip->getFromName('xl/workbook.xml')
+        ));
+        $zip->close();
+
+        $excel = new Excel($path);
+        $excel->name('Alpha', 'New Name')->name('Omega', 'Last');
+        $definedNames = simplexml_load_string($this->zipEntry($this->generateToFile($excel), 'xl/workbook.xml'))->definedNames->definedName;
+
+        // 複数シートにまたがる参照は、全体を1組の引用符で囲む
+        $this->assertSame("SUM('New Name:Last'!A1)+SUM('Mid:New Name'!B2)", (string) $definedNames[0]);
+        // シート名は大文字・小文字を区別しない
+        $this->assertSame("'New Name'!\$A\$1+'New Name'!\$A\$2+'New Name:Last'!A1", (string) $definedNames[1]);
+        // セル範囲の終端に付いたシート名（A1:Sheet!B2）は、セルを巻き込まずに書き換える
+        $this->assertSame("'New Name'!A1:'New Name'!B2+Mid!A1:Last!B2", (string) $definedNames[2]);
+        // 別のブックのシートは書き換えない
+        $this->assertSame("'C:\\dir\\[book.xlsx]Alpha'!A1+[1]Alpha!A1", (string) $definedNames[3]);
     }
 }

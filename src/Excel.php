@@ -46,7 +46,14 @@ class Excel
 
     public function __construct($excelName)
     {
-        $this->excelName = $excelName;
+        // 相対パスは、開いた時点のカレントディレクトリを基準にした絶対パスで覚えておく
+        // （後でカレントディレクトリが変わっても、開き直しや読み取りで別のファイルを見に行かない）
+        // シンボリックリンクは解決しない（download() の既定のファイル名などに、指定された名前を使うため）
+        $isRelative = is_string($excelName) && $excelName !== ''
+            && ! preg_match('#^(?:[/\\\\]|[A-Za-z]:[/\\\\]|[A-Za-z][A-Za-z0-9+.\-]*://)#', $excelName);
+        $workingDirectory = $isRelative ? getcwd() : false;
+        $this->excelName = $workingDirectory !== false ? rtrim($workingDirectory, '/\\').'/'.$excelName : $excelName;
+
         $this->excelTemplate = new \ZipArchive;
         $this->templateLoaded = $this->excelTemplate->open($excelName) === true;
     }
@@ -94,7 +101,9 @@ class Excel
             return false;
         }
 
-        return iterator_to_array(self::readRowData(\WeakReference::create($this), $sheetName, $columns), false);
+        // 全体を一度に読むときは、開いてある Zip から読む（読んでいる間に他の処理がファイルを保存しても、
+        // シートと共有文字列で新旧の内容が混ざらない）
+        return iterator_to_array(self::readRowData(\WeakReference::create($this), $sheetName, is_array($columns) ? $columns : [], false), false);
     }
 
     /**
@@ -111,7 +120,9 @@ class Excel
 
         $sheetName = $this->findWorksheet($sheetNo);
         if ($sheetName !== false) {
-            $this->streamRows = self::readRowData(\WeakReference::create($this), $sheetName, $columns);
+            // 列フィルタに配列以外（null など）が渡された場合は、指定なしとして扱う
+            // 1行ずつ読むときは、一時ファイルに展開せず Zip の中身を直接読む（大きなシート向け）
+            $this->streamRows = self::readRowData(\WeakReference::create($this), $sheetName, is_array($columns) ? $columns : [], true);
         }
     }
 
@@ -294,14 +305,15 @@ class Excel
      *
      * @param  \WeakReference<self>  $excel
      * @param  array<int>  $columns  取得する列インデックスの配列（空の場合は全列）
+     * @param  bool  $direct  Zip の中身を直接読むか（getWorksheetSourceUri() を参照）
      * @return \Generator<int, array<int, mixed>>
      */
-    private static function readRowData(\WeakReference $excel, string $sheetName, array $columns): \Generator
+    private static function readRowData(\WeakReference $excel, string $sheetName, array $columns, bool $direct): \Generator
     {
         $columnsSet = empty($columns) ? [] : array_flip($columns);
         $expectedRow = 1;
 
-        $source = $excel->get()?->getWorksheetSourceUri($sheetName) ?? ['', null];
+        $source = $excel->get()?->getWorksheetSourceUri($sheetName, $direct) ?? ['', null];
 
         foreach (self::readRows(...$source) as $rowNumber => $innerXml) {
             // 空白行を空配列で補完する
@@ -396,7 +408,7 @@ class Excel
         $cache = ['values' => [], 'formulas' => []];
         $this->sharedFormulasCache[$sheetName] = [];
 
-        foreach (self::readRows(...$this->getWorksheetSourceUri($sheetName)) as $rowNumber => $innerXml) {
+        foreach (self::readRows(...$this->getWorksheetSourceUri($sheetName, false)) as $rowNumber => $innerXml) {
             if ($innerXml === '') {
                 continue;
             }
@@ -435,8 +447,7 @@ class Excel
     /**
      * 数式中のセル参照を2セル間のオフセットで平行移動する（共有数式のメンバーセル用）
      * 絶対参照（$付き）の軸は固定し、文字列リテラル・シート名・関数名は変換しない
-     * 制限: 列パターンと衝突する定義名（TAX2020等）は誤変換され得る。
-     * 列・行全体の参照（A:A、1:1）はセル参照パターンに一致しないため変換されない
+     * 列全体・行全体の参照（A:A、1:1）も移動し、シートの範囲外に出る参照は #REF! にする
      */
     private function translateFormulaReferences(string $formula, string $fromCell, string $toCell): string
     {
@@ -456,17 +467,36 @@ class Excel
             }
 
             // 後読みでトークン途中を、先読みで関数名（LOG10(）とシート名（S1!A1）を除外する
+            // セル参照（A1）、列全体（A:B）、行全体（1:2）の順に試す
             $segments[$i] = preg_replace_callback(
-                '/(?<![A-Za-z0-9_$])(\$?)([A-Z]{1,3})(\$?)(\d{1,7})(?![A-Za-z0-9_(!])/',
+                '/(?<![A-Za-z0-9_$.])(?:(\$?)([A-Z]{1,3})(\$?)(\d{1,7})|(\$?)([A-Z]{1,3}):(\$?)([A-Z]{1,3})|(\$?)(\d{1,7}):(\$?)(\d{1,7}))(?![A-Za-z0-9_(!.])/',
                 function ($matches) use ($deltaColumn, $deltaRow) {
-                    $columnIndex = $this->columnNameToIndex($matches[2]) + ($matches[1] === '$' ? 0 : $deltaColumn);
-                    $rowNumber = (int) $matches[4] + ($matches[3] === '$' ? 0 : $deltaRow);
+                    $moveColumn = function (string $absolute, string $name) use ($deltaColumn): ?string {
+                        $columnIndex = $this->columnNameToIndex($name) + ($absolute === '$' ? 0 : $deltaColumn);
 
-                    if ($columnIndex < 0 || $rowNumber < 1) {
-                        return '#REF!';
+                        return $columnIndex < 0 || $columnIndex > self::MAX_COLUMN_INDEX ? null : $absolute.$this->resolveColumnName($columnIndex);
+                    };
+                    $moveRow = function (string $absolute, string $number) use ($deltaRow): ?string {
+                        $rowNumber = (int) $number + ($absolute === '$' ? 0 : $deltaRow);
+
+                        return $rowNumber < 1 || $rowNumber > self::MAX_ROW_NUMBER ? null : $absolute.$rowNumber;
+                    };
+
+                    if (($matches[9] ?? '') !== '' || ($matches[10] ?? '') !== '') {
+                        $first = $moveRow($matches[9], $matches[10]);
+                        $last = $moveRow($matches[11], $matches[12]);
+                        $separator = ':';
+                    } elseif (($matches[6] ?? '') !== '') {
+                        $first = $moveColumn($matches[5], $matches[6]);
+                        $last = $moveColumn($matches[7], $matches[8]);
+                        $separator = ':';
+                    } else {
+                        $first = $moveColumn($matches[1], $matches[2]);
+                        $last = $moveRow($matches[3], $matches[4]);
+                        $separator = '';
                     }
 
-                    return $matches[1].$this->resolveColumnName($columnIndex).$matches[3].$rowNumber;
+                    return $first === null || $last === null ? '#REF!' : $first.$separator.$last;
                 },
                 $segment
             );
@@ -587,7 +617,8 @@ class Excel
             return $number == 0.0 ? '0' : $value;
         }
 
-        $integerDigits = max(1, (int) floor(log10(abs($number))) + 1);
+        // 対数で数えると 99999999999999.9 のような値が丸めで1桁多くなるため、整数部を文字列にして数える
+        $integerDigits = strlen(sprintf('%.0F', floor(abs($number))));
         $decimals = max(0, min(14, 15 - $integerDigits));
 
         $normalized = number_format(round($number, $decimals), $decimals, '.', '');
@@ -606,6 +637,11 @@ class Excel
     {
         if ($innerXml === '') {
             return '';
+        }
+
+        // CDATA で書かれた文字列は、通常のエスケープ済みテキストにそろえてから扱う
+        if (str_contains($innerXml, '<![CDATA[')) {
+            $innerXml = preg_replace_callback('/<!\[CDATA\[([\s\S]*?)\]\]>/', fn ($matches) => htmlspecialchars($matches[1], ENT_XML1 | ENT_NOQUOTES, 'UTF-8'), $innerXml) ?? $innerXml;
         }
 
         // 要素名には名前空間プレフィックスが付くことがある（<x:t> など。Open XML SDK の出力）
@@ -634,7 +670,7 @@ class Excel
         $this->readSharedStringsCache = [];
         $this->readSharedStringsLoaded = true;
 
-        foreach (self::readElements(...[...$this->getWorksheetSourceUri(self::SHARED_STRINGS_PATH), 'si']) as $innerXml) {
+        foreach (self::readElements(...[...$this->getWorksheetSourceUri(self::SHARED_STRINGS_PATH, false), 'si']) as $innerXml) {
             $this->readSharedStringsCache[] = $this->extractTextRuns($innerXml);
         }
     }
@@ -660,16 +696,15 @@ class Excel
      */
     private function loadXmlEntry(string $entryName)
     {
-        [$sourceUri, $tempName] = $this->getWorksheetSourceUri($entryName);
-        if ($sourceUri === '') {
+        // zip:// のURIを simplexml_load_file() に渡すと、libxml がパスの空白や日本語をエスケープしてしまい
+        // 開けない。Zip から内容を取り出して解析する
+        if (! $this->ensureTemplateLoaded()) {
             return false;
         }
 
-        try {
-            return simplexml_load_file($sourceUri);
-        } finally {
-            $tempName !== null && is_file($tempName) && unlink($tempName);
-        }
+        $contents = $this->excelTemplate->getFromName($entryName);
+
+        return is_string($contents) && $contents !== '' ? simplexml_load_string($contents) : false;
     }
 
     /**
@@ -710,11 +745,15 @@ class Excel
     }
 
     /**
-     * ワークシートの読み取り元URIを取得（zip://直接参照を優先、フォールバックでテンポラリ抽出）
+     * Zip内のエントリの読み取り元を取得する
+     *
+     * $direct が true なら zip:// で直接読む（一時ファイルを作らない。使えない場合は一時ファイルに展開する）。
+     * false なら、開いてある Zip から一時ファイルに展開して読む。こちらは、読み込んだ時点の内容を一貫して読める
+     * （zip:// はそのたびにファイルを開き直すので、他の処理が保存した新しい内容が混ざることがある）。
      *
      * @return array{0: string, 1: string|null} [sourceUri, tempPathToCleanup]
      */
-    private function getWorksheetSourceUri(string $sheetName): array
+    private function getWorksheetSourceUri(string $sheetName, bool $direct = true): array
     {
         // generate() の後は Zip を閉じているので、必要なら開き直す
         // （open() で読んでいる途中に generate() / save() しても、続きを読めるようにする）
@@ -723,7 +762,7 @@ class Excel
             return ['', null];
         }
 
-        $realPath = realpath($this->excelName);
+        $realPath = $direct ? realpath($this->excelName) : false;
         $pathHasHash = str_contains($this->excelName, '#') || ($realPath !== false && str_contains($realPath, '#'));
 
         if ($realPath !== false && ! $pathHasHash) {
@@ -758,13 +797,14 @@ class Excel
             return $this->sheetIndexCache;
         }
 
-        $this->sheetIndexCache = ['names' => [], 'paths' => []];
+        // 途中で Zip を開き直すとキャッシュが捨てられるため、ローカル変数で組み立ててから保持する
+        $sheetIndex = ['names' => [], 'paths' => []];
 
         $workbookXml = $this->loadXmlEntry('xl/workbook.xml');
         // SimpleXMLElement は「既定の名前空間の子要素がない」と偽と評価されるため、false との比較で判定する
         $sheetNodes = $workbookXml !== false ? $this->workbookSheetNodes($workbookXml) : [];
         if (! count($sheetNodes)) {
-            return $this->sheetIndexCache;
+            return $this->sheetIndexCache = $sheetIndex;
         }
 
         // relsからrId => ワークシートパスの対応を取得する
@@ -782,29 +822,24 @@ class Excel
         $position = 0;
         foreach ($sheetNodes as $sheet) {
             $position++;
-            $relId = (string) ($sheet->attributes('http://schemas.openxmlformats.org/officeDocument/2006/relationships')->id ?? '');
-            $this->sheetIndexCache['names'][] = (string) $sheet->attributes()->name;
-            $this->sheetIndexCache['paths'][] = $relTargets[$relId] ?? 'xl/worksheets/sheet'.$position.'.xml';
+            // r:id も名前空間のURIに依存せずに読む
+            $relId = (string) (($sheet->xpath('@*[local-name()="id" and namespace-uri()!=""]') ?: [''])[0]);
+            $sheetIndex['names'][] = (string) $sheet->attributes()->name;
+            $sheetIndex['paths'][] = $relTargets[$relId] ?? 'xl/worksheets/sheet'.$position.'.xml';
         }
 
-        return $this->sheetIndexCache;
+        return $this->sheetIndexCache = $sheetIndex;
     }
 
     /**
-     * workbook.xml の sheet 要素を並び順で返す（要素に名前空間プレフィックスが付いていても取得できる）
+     * workbook.xml の sheet 要素を並び順で返す（名前空間プレフィックス付きや Strict 形式でも取得できる）
      *
      * @return array<int, \SimpleXMLElement>
      */
     private function workbookSheetNodes(\SimpleXMLElement $workbookXml): array
     {
-        $sheetNodes = [];
-        foreach ($workbookXml->children(self::MAIN_NS)->sheets as $sheets) {
-            foreach ($sheets->children(self::MAIN_NS)->sheet as $sheet) {
-                $sheetNodes[] = $sheet;
-            }
-        }
-
-        return $sheetNodes;
+        // 名前空間に依存せずに探す（Strict Open XML 形式は名前空間のURIが異なる）
+        return $workbookXml->xpath('/*[local-name()="workbook"]/*[local-name()="sheets"]/*[local-name()="sheet"]') ?: [];
     }
 
     /**
@@ -857,6 +892,10 @@ class Excel
      */
     private function normalizeCoordinate($sheetColumn, $sheetRow): ?array
     {
+        // 文字列として扱えるオブジェクト（Illuminate\Support\Stringable など）は文字列にする
+        $sheetColumn instanceof \Stringable && $sheetColumn = (string) $sheetColumn;
+        $sheetRow instanceof \Stringable && $sheetRow = (string) $sheetRow;
+
         if (is_int($sheetColumn)) {
             $columnIndex = $sheetColumn;
         } elseif (is_string($sheetColumn) && preg_match('/^[A-Za-z]{1,3}$/', $sheetColumn)) {
@@ -867,7 +906,8 @@ class Excel
 
         if (is_int($sheetRow)) {
             $rowNumber = $sheetRow + 1;
-        } elseif (is_string($sheetRow) && ctype_digit($sheetRow)) {
+        } elseif (is_numeric($sheetRow) || is_bool($sheetRow)) {
+            // int 以外の数値（'5'、2.0、' 1' など）は、従来どおり1始まりの行番号として扱う
             $rowNumber = (int) $sheetRow;
         } else {
             return null;
@@ -918,7 +958,14 @@ class Excel
     {
         $directory = sys_get_temp_dir();
 
-        if (! is_writable($directory) && function_exists('config')) {
+        // open_basedir の外だと is_writable() 自体が警告を出すので、警告は抑える
+        try {
+            $writable = @is_writable($directory);
+        } catch (\Throwable) {
+            $writable = false;
+        }
+
+        if (! $writable && function_exists('config')) {
             try {
                 $directory = config('view.compiled') ?: $directory;
             } catch (\Throwable) {

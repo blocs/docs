@@ -111,35 +111,91 @@ trait ExcelSetTrait
     public function save($filename = null)
     {
         isset($filename) || $filename = $this->excelName;
+        $filename instanceof \Stringable && $filename = (string) $filename;
+        if (! is_string($filename) || $filename === '') {
+            // 生成してから失敗すると一時ファイルが残るので、先に確かめる
+            throw new \InvalidArgumentException('Invalid file name: '.get_debug_type($filename));
+        }
 
         $generatedPath = $this->generateFile();
         if ($generatedPath === false) {
             return false;
         }
 
-        // 生成済みのファイルを保存先へ移す（内容をメモリに読み込まない）
-        // 既存のファイルは中身だけを書き換える。シンボリックリンクならリンク先を更新し、パーミッションも変えない
-        $exists = file_exists($filename);
-        try {
-            $saved = $exists
-                ? is_writable($filename) && copy($generatedPath, $filename)
-                : is_writable(dirname($filename)) && rename($generatedPath, $filename);
-        } catch (\Throwable) {
-            $saved = false;
-        }
-        is_file($generatedPath) && unlink($generatedPath);
+        if (! $this->moveGeneratedFile($generatedPath, $filename)) {
+            is_file($generatedPath) && unlink($generatedPath);
 
-        if (! $saved) {
             // 保存できなかった編集内容は、次の set() で破棄せずに残す（保存先を変えてやり直せる）
             $this->generated = false;
 
             return false;
         }
 
-        // 新しく作ったファイルは、他のユーザーも読めるようにする
-        $exists || chmod($filename, 0644);
-
         return true;
+    }
+
+    /**
+     * 生成済みのファイルを保存先へ移す（内容をメモリに読み込まない）
+     *
+     * 保存先と同じディレクトリに置いてから rename で置き換えるので、書きかけの状態が見えることはなく、
+     * 元のファイルを読んでいる途中のストリーム（このインスタンスの open() を含む）も最後まで読める。
+     * 既存のファイルのパーミッションは引き継ぎ、シンボリックリンクはリンク先を置き換える。
+     */
+    private function moveGeneratedFile(string $generatedPath, string $filename): bool
+    {
+        // php://output などのストリームラッパーには、ディレクトリ経由の置き換えができないので直接書き込む
+        if (preg_match('#^(?!file://)[A-Za-z][A-Za-z0-9+.\-]*://#', $filename)) {
+            return $this->tryFileOperation(fn () => copy($generatedPath, $filename) && unlink($generatedPath));
+        }
+
+        // リンク先がまだないシンボリックリンクは、リンク先に作る（リンクを通常ファイルに置き換えない）
+        if (is_link($filename) && ! file_exists($filename)) {
+            $linkTarget = readlink($filename);
+            $filename = str_starts_with($linkTarget, '/') ? $linkTarget : dirname($filename).'/'.$linkTarget;
+        }
+
+        $exists = file_exists($filename);
+        $target = $exists ? (realpath($filename) ?: $filename) : $filename;
+        $directory = dirname($target);
+
+        // 書き込み禁止にしてあるファイルは置き換えない
+        if ($exists && ! is_writable($target)) {
+            return false;
+        }
+
+        if (! is_dir($directory) || ! is_writable($directory)) {
+            // ディレクトリには書けないが、ファイル自体には書ける場合は中身を書き換える
+            return $exists && $this->tryFileOperation(fn () => copy($generatedPath, $target) && unlink($generatedPath));
+        }
+
+        // 保存先の名前を含めると、長いファイル名でファイルシステムの上限を超える
+        $temporaryPath = $directory.'/.blocs-'.bin2hex(random_bytes(8)).'.tmp';
+
+        // 一時ディレクトリと保存先が別のファイルシステムで移動できない場合は、コピーする
+        $staged = $this->tryFileOperation(fn () => rename($generatedPath, $temporaryPath))
+            || $this->tryFileOperation(fn () => copy($generatedPath, $temporaryPath) && unlink($generatedPath));
+
+        // 既存のファイルのパーミッションを引き継ぐ。新しく作るファイルは他のユーザーも読めるようにする
+        // （パーミッションを変更できないファイルシステムでも、保存自体は続ける）
+        $permissions = $exists ? fileperms($target) & 0777 : 0644;
+        $staged && $this->tryFileOperation(fn () => chmod($temporaryPath, $permissions));
+
+        $saved = $staged && $this->tryFileOperation(fn () => rename($temporaryPath, $target));
+        $saved || (is_file($temporaryPath) && unlink($temporaryPath));
+
+        return $saved;
+    }
+
+    /**
+     * ファイル操作を実行し、成功したかを返す（警告を例外に変換する環境でも、失敗として扱う）
+     */
+    private function tryFileOperation(callable $operation): bool
+    {
+        try {
+            return (bool) @$operation();
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     /**
@@ -182,9 +238,13 @@ trait ExcelSetTrait
             // ストリーミング処理で変更行のみ編集（メモリ効率を重視）
             foreach ($this->pendingCellValues as $sheetName => $sheetValues) {
                 $modifiedPath = $this->streamApplyValuesToSheet($sheetName, $sheetValues);
-                if ($modifiedPath !== null) {
-                    $this->worksheetXml[$sheetName] = $modifiedPath;
+                if ($modifiedPath === null) {
+                    // 値を書き込めないシート（グラフシートや Strict Open XML 形式など）。
+                    // 指定された値を黙って捨てたファイルを出力しない
+                    return false;
                 }
+
+                $this->worksheetXml[$sheetName] = $modifiedPath;
             }
 
             // 文字列を追加するため共有文字列XMLを更新する
@@ -307,7 +367,10 @@ trait ExcelSetTrait
 
             // エクセルは存在しない 1900-02-29 をシリアル値 60 として数えるため、それより前の日付は1日ずれる
             // （1900-01-01 = 1、1900-02-28 = 59、1900-03-01 = 61）
-            return $serial < 61 ? $serial - 1 : $serial;
+            $serial < 61 && $serial--;
+
+            // 1900-01-01 より前はエクセルの日時として表せないので、文字列で書き込む
+            return $serial < 1 ? $value->format('Y-m-d H:i:s') : $serial;
         }
 
         if ($value instanceof \Stringable) {
@@ -369,6 +432,7 @@ trait ExcelSetTrait
         $modified = false;
         $renamedSheets = [];
         $sheetNodes = $this->workbookSheetNodes($workbookXml);
+        $originalSheetNames = array_map(fn ($sheetNode) => (string) $sheetNode->attributes()->name, $sheetNodes);
         foreach ($this->pendingSheetNames as $sheetNo => $newSheetName) {
             if (! isset($sheetNodes[$sheetNo - 1])) {
                 continue;
@@ -379,11 +443,14 @@ trait ExcelSetTrait
             dom_import_simplexml($sheetNodes[$sheetNo - 1])->setAttribute('name', $newSheetName);
             $modified = true;
         }
-        $this->renameSheetsInDefinedNames($workbookXml, $renamedSheets);
+        $this->renameSheetsInDefinedNames($workbookXml, $renamedSheets, $originalSheetNames);
 
         // エクセルはシート名の大文字と小文字を区別しない。同じ名前のシートがあるとファイルが壊れる
         $finalNames = array_map(fn ($sheetNode) => mb_strtolower((string) $sheetNode->attributes()->name), $sheetNodes);
         if ($renamedSheets && count($finalNames) !== count(array_unique($finalNames))) {
+            // 重複したシート名の指定は破棄する（残しておくと、以後の generate() が毎回失敗する）
+            $this->pendingSheetNames = [];
+
             throw new \InvalidArgumentException('Duplicate sheet name');
         }
 
@@ -405,27 +472,56 @@ trait ExcelSetTrait
      * シート名の入れ替え（A→B と B→A）でも取り違えないよう、すべての変更を1回の置換で行う
      *
      * @param  array<string, string>  $renamedSheets  旧シート名 => 新シート名
+     * @param  array<int, string>  $sheetNames  変更前のすべてのシート名
      */
-    private function renameSheetsInDefinedNames(\SimpleXMLElement $workbookXml, array $renamedSheets): void
+    private function renameSheetsInDefinedNames(\SimpleXMLElement $workbookXml, array $renamedSheets, array $sheetNames): void
     {
-        $renamedSheets = array_filter($renamedSheets, fn ($newName, $oldName) => $newName !== (string) $oldName, ARRAY_FILTER_USE_BOTH);
-        if (! $renamedSheets) {
+        // シート名は大文字・小文字を区別しない
+        $renameMap = [];
+        foreach ($renamedSheets as $oldName => $newName) {
+            $newName !== (string) $oldName && $renameMap[mb_strtolower((string) $oldName)] = $newName;
+        }
+        if (! $renameMap) {
             return;
         }
+        $knownSheets = array_flip(array_map(fn ($sheetName) => mb_strtolower($sheetName), $sheetNames));
 
         // 記号や空白を含まない名前は 'Sheet1'!A1 ではなく Sheet1!A1 と書ける
         $bareName = '[\p{L}_][\p{L}\p{N}_.]*';
 
-        $rename = function (array $matches) use ($renamedSheets, $bareName) {
-            // $matches[1]: 'Sheet 1'! のクォート内、$matches[2]: Sheet1! の名前
-            $oldName = ($matches[2] ?? '') !== '' ? $matches[2] : str_replace("''", "'", $matches[1]);
-            if (! isset($renamedSheets[$oldName])) {
+        // セル参照（A1、R1C1）や TRUE / FALSE に見える名前は、引用符で囲まないと別の意味に読まれる
+        $needsQuote = fn (string $sheetName) => ! preg_match('/^'.$bareName.'$/u', $sheetName)
+            || preg_match('/^(?:[A-Za-z]{1,3}[0-9]+|[Rr][0-9]*[Cc][0-9]*|[Rr][0-9]*|[Cc][0-9]*|true|false)$/i', $sheetName);
+
+        // 複数シートにまたがる参照（Sheet1:Sheet3!A1）は、全体を1組の引用符で囲む
+        $formatReference = function (array $sheetNames) use ($needsQuote) {
+            foreach ($sheetNames as $sheetName) {
+                if ($needsQuote($sheetName)) {
+                    return "'".str_replace("'", "''", implode(':', $sheetNames))."'!";
+                }
+            }
+
+            return implode(':', $sheetNames).'!';
+        };
+
+        $rename = function (array $matches) use ($renameMap, $knownSheets, $formatReference) {
+            // $matches[1]: 'Sheet 1'! のクォート内、$matches[2]: Sheet1! の名前、$matches[3]: Sheet1:Sheet3! の終端
+            $quoted = ($matches[2] ?? '') === '';
+            $oldNames = $quoted
+                ? explode(':', str_replace("''", "'", $matches[1]), 2)
+                : array_filter([$matches[2], $matches[3] ?? ''], fn ($name) => $name !== '');
+
+            $newNames = array_map(fn ($name) => $renameMap[mb_strtolower($name)] ?? $name, $oldNames);
+            if ($newNames === $oldNames) {
                 return $matches[0];
             }
 
-            $newName = $renamedSheets[$oldName];
+            // A1:Sheet1!B2 の A1 はシート名ではなくセルなので、シート名の部分だけを書き換える
+            if (! $quoted && count($oldNames) === 2 && ! isset($knownSheets[mb_strtolower($oldNames[0])])) {
+                return $oldNames[0].':'.$formatReference([$newNames[1]]);
+            }
 
-            return (preg_match('/^'.$bareName.'$/u', $newName) ? $newName : "'".str_replace("'", "''", $newName)."'").'!';
+            return $formatReference($newNames);
         };
 
         foreach ($workbookXml->children(self::MAIN_NS)->definedNames as $definedNames) {
@@ -436,7 +532,7 @@ trait ExcelSetTrait
                 $segments = preg_split('/("(?:""|[^"])*")/u', $formula, -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$formula];
                 foreach ($segments as $index => $segment) {
                     if ($segment !== '' && $segment[0] !== '"') {
-                        $segments[$index] = preg_replace_callback('/\'((?:[^\']|\'\')+)\'!|(?<![\p{L}\p{N}_.\'\]])('.$bareName.')!/u', $rename, $segment) ?? $segment;
+                        $segments[$index] = preg_replace_callback('/\'((?:[^\']|\'\')+)\'!|(?<![\p{L}\p{N}_.\'\]])('.$bareName.')(?::('.$bareName.'))?!/u', $rename, $segment) ?? $segment;
                     }
                 }
                 $renamed = implode('', $segments);
@@ -457,7 +553,9 @@ trait ExcelSetTrait
      */
     private function streamApplyValuesToSheet(string $sheetName, array $pendingValues): ?string
     {
-        [$sourceUri, $tempToCleanup] = $this->getWorksheetSourceUri($sheetName);
+        // 共有文字列など他のパーツと同じ時点の内容になるよう、開いている Zip から読む
+        // （ファイルパスから読み直すと、読み込み後に別の処理が書き換えた内容と混ざる）
+        [$sourceUri, $tempToCleanup] = $this->getWorksheetSourceUri($sheetName, false);
         if ($sourceUri === '') {
             return null;
         }
@@ -497,7 +595,7 @@ trait ExcelSetTrait
                 $isMainElement = $isElement && $reader->namespaceURI === self::MAIN_NS;
 
                 if ($isElement && $reader->depth === 0 && ! ($isMainElement && $reader->localName === 'worksheet')) {
-                    // グラフシートなど、ワークシート以外は編集しない（そのまま出力する）
+                    // グラフシートなど、ワークシート以外は編集できない
                     return null;
                 }
 
@@ -546,7 +644,11 @@ trait ExcelSetTrait
                     // sheetData外の要素はworksheet直下（depth 1）のみ丸ごとコピーする。
                     // readOuterXml()はリーダーを進めないため、depth 2以下も対象にすると
                     // 直後のread()で子要素に降りて同じ内容が重複して書き出されてしまう
-                    fwrite($writer, $reader->readOuterXml());
+                    $outerXml = $reader->readOuterXml();
+                    if ($isMainElement && $reader->localName === 'dimension') {
+                        $outerXml = $this->expandDimension($outerXml, (string) $reader->getAttribute('ref'), $pendingValues);
+                    }
+                    fwrite($writer, $outerXml);
                 }
             }
 
@@ -561,6 +663,43 @@ trait ExcelSetTrait
             // 失敗した場合や途中で例外が起きた場合は、書きかけのテンポラリを残さない
             $succeeded || (is_file($outPath) && unlink($outPath));
         }
+    }
+
+    /**
+     * 値を設定するセルがシートの使用範囲（dimension）の外にある場合は、範囲を広げる
+     * （使用範囲を信用して読むツールで、追加したセルが読まれなくなるのを防ぐ）
+     *
+     * @param  array<string, array<string, mixed>>  $pendingValues  行名 => [セル名 => 値]
+     */
+    private function expandDimension(string $dimensionXml, string $ref, array $pendingValues): string
+    {
+        if (! preg_match('/^([A-Z]{1,3})(\d{1,7})(?::([A-Z]{1,3})(\d{1,7}))?$/', $ref, $matches)) {
+            return $dimensionXml;
+        }
+
+        $firstColumn = $this->columnNameToIndex($matches[1]);
+        $firstRow = (int) $matches[2];
+        $lastColumn = isset($matches[3]) ? $this->columnNameToIndex($matches[3]) : $firstColumn;
+        $lastRow = isset($matches[4]) ? (int) $matches[4] : $firstRow;
+        $original = [$firstColumn, $firstRow, $lastColumn, $lastRow];
+
+        foreach ($pendingValues as $rowNumber => $rowValues) {
+            $firstRow = min($firstRow, (int) $rowNumber);
+            $lastRow = max($lastRow, (int) $rowNumber);
+            foreach (array_keys($rowValues) as $cellName) {
+                $columnIndex = $this->columnNameToIndex((string) $cellName);
+                $firstColumn = min($firstColumn, $columnIndex);
+                $lastColumn = max($lastColumn, $columnIndex);
+            }
+        }
+
+        if ([$firstColumn, $firstRow, $lastColumn, $lastRow] === $original) {
+            return $dimensionXml;
+        }
+
+        $expandedRef = $this->resolveColumnName($firstColumn).$firstRow.':'.$this->resolveColumnName($lastColumn).$lastRow;
+
+        return preg_replace('/(\sref=)(["\'])[^"\']*\2/', '$1"'.$expandedRef.'"', $dimensionXml, 1) ?? $dimensionXml;
     }
 
     private function readerAttributesToXml(XMLReader $reader): string
@@ -857,8 +996,10 @@ trait ExcelSetTrait
         // 共有文字列XMLを読み込み、カウントを更新する
         $sharedXml = $this->loadWorksheetXml(self::SHARED_STRINGS_PATH);
 
-        $sharedXml['count'] = intval($sharedXml['count']) + count($this->pendingSharedStrings);
-        $sharedXml['uniqueCount'] = intval($sharedXml['uniqueCount']) + count($this->pendingSharedStrings);
+        // 件数の属性がないファイルでは、実際の文字列の数（既存 + 追加分）を書く
+        $addedCount = count($this->pendingSharedStrings);
+        $sharedXml['uniqueCount'] = isset($sharedXml['uniqueCount']) ? intval($sharedXml['uniqueCount']) + $addedCount : $this->sharedStringsCount;
+        $sharedXml['count'] = isset($sharedXml['count']) ? intval($sharedXml['count']) + $addedCount : intval($sharedXml['uniqueCount']);
 
         // 共有文字列XMLへ新しい文字列を追加する（addChildは&をエスケープしないため事前に変換）
         foreach ($this->pendingSharedStrings as $value) {
