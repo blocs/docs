@@ -7,6 +7,9 @@ if (! function_exists('docs')) {
             return;
         }
 
+        // 名前付き引数や文字列キーの配列の展開で呼ばれても、順番どおりに扱う
+        $arguments = array_values($arguments);
+
         // 引数が1つなら処理だけ、2つなら「入力, 処理」、3つ以上なら「入力, 処理, 出力, バリデーション」
         [$inputDocs, $processDocs, $outputDocs, $validationDocs] = match (true) {
             count($arguments) > 2 => $arguments + [3 => null],
