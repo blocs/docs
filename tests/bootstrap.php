@@ -1,11 +1,14 @@
 <?php
 
 $packageRoot = dirname(__DIR__);
-$autoloadCandidates = [
-    dirname($packageRoot, 2).'/test-admin/vendor/autoload.php',
-    dirname($packageRoot, 2).'/autoload.php',
+// 1) 環境変数 BLOCS_TEST_AUTOLOAD で任意のアプリの autoload.php を指定した場合
+// 2) パッケージ単体で composer install した場合
+// 3) アプリの vendor/blocs/docs として入っている場合
+$autoloadCandidates = array_filter([
+    getenv('BLOCS_TEST_AUTOLOAD') ?: null,
     $packageRoot.'/vendor/autoload.php',
-];
+    dirname($packageRoot, 2).'/autoload.php',
+]);
 
 foreach ($autoloadCandidates as $autoload) {
     if (is_file($autoload)) {

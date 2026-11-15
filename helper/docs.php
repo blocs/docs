@@ -7,31 +7,28 @@ if (! function_exists('docs')) {
             return;
         }
 
-        $argumentCount = count($arguments);
+        // 引数が1つなら処理だけ、2つなら「入力, 処理」、3つ以上なら「入力, 処理, 出力, バリデーション」
+        [$inputDocs, $processDocs, $outputDocs, $validationDocs] = match (true) {
+            count($arguments) > 2 => $arguments + [3 => null],
+            count($arguments) > 1 => [$arguments[0], $arguments[1], null, null],
+            default => [null, $arguments[0] ?? null, null, null],
+        };
 
-        $inputDocs = [];
-        $processDocs = [];
-        $outputDocs = [];
-        $validationDocs = [];
-
-        if ($argumentCount > 2) {
-            $inputDocs = $arguments[0] ?? [];
-            $processDocs = $arguments[1] ?? [];
-            $outputDocs = $arguments[2] ?? [];
-            $validationDocs = $arguments[3] ?? [];
-        } elseif ($argumentCount > 1) {
-            $inputDocs = $arguments[0] ?? [];
-            $processDocs = $arguments[1] ?? [];
-        } else {
-            $processDocs = $arguments[0] ?? [];
-        }
-
+        // 配列でない指定は配列にそろえる（入力・出力・バリデーションは 名前 => 詳細、処理は処理のリスト）
         $normalizeDocs = static function ($value, bool $associative) {
             if (is_array($value)) {
                 return $value;
             }
+            if ($value === null) {
+                return [];
+            }
 
-            return $associative ? [$value => []] : [$value];
+            if (! $associative) {
+                return [$value];
+            }
+
+            // 配列のキーにできない値（オブジェクトなど）は、記録しない
+            return is_string($value) || is_int($value) || is_float($value) || is_bool($value) ? [(string) $value => []] : [];
         };
 
         $inputDocs = $normalizeDocs($inputDocs, true);

@@ -15,6 +15,20 @@
             "role": "Lead Developer"
         }
     ],
+    "require": {
+        "php": ">=8.3",
+        "ext-dom": "*",
+        "ext-mbstring": "*",
+        "ext-simplexml": "*",
+        "ext-xmlreader": "*",
+        "ext-zip": "*"
+    },
+    "require-dev": {
+        "phpunit\/phpunit": "^11.0 || ^12.0"
+    },
+    "suggest": {
+        "laravel\/framework": "ミドルウェア（Blocs\\Middleware\\Docs）と Excel::download() を使う場合に必要 (>=10)"
+    },
     "autoload": {
         "psr-4": {
             "Blocs\\": "src\/"

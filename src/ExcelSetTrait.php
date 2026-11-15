@@ -22,6 +22,23 @@ trait ExcelSetTrait
 
     private $pendingSheetNames = [];
 
+    /** @var bool 現在の編集内容で生成済みか（次の set() / name() で編集内容を破棄する） */
+    private $generated = false;
+
+    /** @var array<int, array{cell: string, formula: string}> 上書きで失われた共有数式のマスター（si => マスターセルと式） */
+    private $droppedSharedFormulas = [];
+
+    /**
+     * 指定シートの指定セルへ値を設定する（generate() / save() / download() で反映される）
+     *
+     * @param  int|string  $sheetNo  シート番号（1始まり）またはシート名
+     * @param  int|string  $sheetColumn  列番号（0始まり）または列名（'A'等）
+     * @param  int|string  $sheetRow  行番号（intは0始まり、stringは1始まり）
+     * @param  mixed  $value  文字列・数値・真偽値・null（セルを空にする）・日時（シリアル値で書き込む）
+     * @return $this|false 指定されたシートが存在しない場合は false
+     *
+     * @throws \InvalidArgumentException セルの位置がエクセルの範囲外、または書き込めない型の値
+     */
     public function set($sheetNo, $sheetColumn, $sheetRow, $value)
     {
         // 指定されたシートが存在しない場合は設定しない
@@ -31,18 +48,37 @@ trait ExcelSetTrait
         }
 
         // 列番号・行番号をエクセル表記の列名・行名へ整形する
-        [$columnName, $rowName] = $this->normalizeCoordinate($sheetColumn, $sheetRow);
+        $coordinate = $this->normalizeCoordinate($sheetColumn, $sheetRow);
+        if ($coordinate === null) {
+            // 不正なセル参照を書き出すと壊れたファイルになるため、ここで知らせる
+            throw new \InvalidArgumentException('Invalid cell position: column '.var_export($sheetColumn, true).', row '.var_export($sheetRow, true));
+        }
+        [$columnName, $rowName] = $coordinate;
+        $value = $this->normalizeCellValue($value);
+
+        // 生成後に新しい編集を始めたら、前回の編集内容を破棄する
+        // （シート・座標・値の検証が通ってから。失敗した set() で前回の内容を失わない）
+        $this->discardGeneratedEdits();
 
         $this->pendingCellValues[$sheetName][$rowName][$columnName.$rowName] = $value;
 
         return $this;
     }
 
+    /**
+     * シート名を変更する（generate() / save() / download() で反映される）
+     *
+     * エクセルで使えない文字（[ ] : * ? / \）は「_」に置き換え、31文字を超える分は切り詰める。
+     * 名前の定義（印刷範囲など）にある旧シート名は新しい名前へ書き換えるが、セルの数式にある参照は書き換えない。
+     */
     public function name($sheetNo, $newSheetName)
     {
-        // シート番号（1始まり）またはシート名を位置に解決する
+        $newSheetName = $this->sanitizeSheetName((string) $newSheetName);
+
+        // シート番号（1始まり）またはシート名を位置に解決する（存在しないシートの指定は無視する）
         $position = $this->resolveSheetPosition($sheetNo);
-        if ($position !== false) {
+        if ($position !== false && $newSheetName !== '' && isset($this->loadSheetIndex()['names'][$position - 1])) {
+            $this->discardGeneratedEdits();
             $this->pendingSheetNames[$position] = $newSheetName;
         }
 
@@ -52,121 +88,233 @@ trait ExcelSetTrait
     public function download($filename = null)
     {
         isset($filename) || $filename = basename($this->excelName);
-        $filename = rawurlencode($filename);
 
         $contents = $this->generate();
         if ($contents === false) {
             return response('', 500);
         }
 
+        // 非ASCIIのファイル名は filename* で渡し、対応していないクライアント向けにASCIIの代替名も付ける
+        $fallbackName = preg_replace('/[^\x20-\x7E]|["\\\\\/]/', '_', $filename);
+
         return response($contents)
             ->header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            ->header('Content-Disposition', 'inline;filename*=UTF-8\'\''.$filename)
+            ->header('Content-Disposition', 'attachment; filename="'.$fallbackName.'"; filename*=UTF-8\'\''.rawurlencode($filename))
             ->header('Cache-Control', 'max-age=0');
     }
 
+    /**
+     * 生成したファイルを保存する
+     *
+     * @param  string|null  $filename  保存先。省略時は読み込んだファイルを上書きする
+     */
     public function save($filename = null)
     {
-        isset($filename) || $filename = basename($this->excelName);
+        isset($filename) || $filename = $this->excelName;
 
-        $contents = $this->generate();
-        if ($contents === false) {
+        $generatedPath = $this->generateFile();
+        if ($generatedPath === false) {
             return false;
         }
 
-        if (file_put_contents($filename, $contents) === false) {
+        // 生成済みのファイルを保存先へ移す（内容をメモリに読み込まない）
+        // 既存のファイルは中身だけを書き換える。シンボリックリンクならリンク先を更新し、パーミッションも変えない
+        $exists = file_exists($filename);
+        try {
+            $saved = $exists
+                ? is_writable($filename) && copy($generatedPath, $filename)
+                : is_writable(dirname($filename)) && rename($generatedPath, $filename);
+        } catch (\Throwable) {
+            $saved = false;
+        }
+        is_file($generatedPath) && unlink($generatedPath);
+
+        if (! $saved) {
+            // 保存できなかった編集内容は、次の set() で破棄せずに残す（保存先を変えてやり直せる）
+            $this->generated = false;
+
             return false;
         }
 
-        chmod($filename, 0644);
+        // 新しく作ったファイルは、他のユーザーも読めるようにする
+        $exists || chmod($filename, 0644);
 
         return true;
     }
 
+    /**
+     * 編集内容を反映したファイルの内容を返す
+     *
+     * @return string|false
+     */
     public function generate()
+    {
+        $generatedPath = $this->generateFile();
+        if ($generatedPath === false) {
+            return false;
+        }
+
+        try {
+            return file_get_contents($generatedPath);
+        } finally {
+            is_file($generatedPath) && unlink($generatedPath);
+        }
+    }
+
+    /**
+     * 編集内容を反映したファイルをテンポラリに生成し、そのパスを返す
+     *
+     * @return string|false
+     */
+    private function generateFile()
     {
         if (! $this->ensureTemplateLoaded()) {
             return false;
         }
 
-        // ストリーミング処理で変更行のみ編集（メモリ効率を重視）
-        foreach ($this->pendingCellValues as $sheetName => $sheetValues) {
-            $modifiedPath = $this->streamApplyValuesToSheet($sheetName, $sheetValues);
-            if ($modifiedPath !== null) {
-                $this->worksheetXml[$sheetName] = $modifiedPath;
-            }
-        }
-
-        // 文字列を追加するため共有文字列XMLを更新する
-        empty($this->pendingSharedStrings) || $this->updateSharedStringsXml();
-
-        // 数式セルを静的値化したあとに calcChain が残ると Excel が修復ダイアログを出すため除外する
-        $shouldOmitCalcChain = ! empty($this->pendingCellValues)
-            && $this->excelTemplate->statName('xl/calcChain.xml');
-        $shouldOmitCalcChain && $this->removeCalcChainPackageParts();
-
-        $excelTemplate = $this->excelTemplate;
-
         // テンポラリファイルを作成してZip書き込み用に確保する
         $tempName = $this->createTempFileName();
-
         $generateName = $tempName.'.zip';
-        $excelGenerate = new \ZipArchive;
-        $excelGenerate->open($generateName, \ZipArchive::CREATE);
+        $succeeded = false;
+        $zipOpened = false;
 
-        for ($i = 0; $i < $excelTemplate->numFiles; $i++) {
-            $sheetName = $excelTemplate->getNameIndex($i);
-            $worksheetString = $excelTemplate->getFromIndex($i);
-
-            if ($shouldOmitCalcChain && $sheetName === 'xl/calcChain.xml') {
-                continue;
+        try {
+            // ストリーミング処理で変更行のみ編集（メモリ効率を重視）
+            foreach ($this->pendingCellValues as $sheetName => $sheetValues) {
+                $modifiedPath = $this->streamApplyValuesToSheet($sheetName, $sheetValues);
+                if ($modifiedPath !== null) {
+                    $this->worksheetXml[$sheetName] = $modifiedPath;
+                }
             }
 
-            if ($sheetName == 'xl/workbook.xml') {
-                $excelGenerate->addFromString($sheetName, $this->buildWorkbookXml($worksheetString));
+            // 文字列を追加するため共有文字列XMLを更新する
+            empty($this->pendingSharedStrings) || $this->updateSharedStringsXml();
 
-                continue;
+            // 数式セルを静的値化したあとに calcChain が残ると Excel が修復ダイアログを出すため除外する
+            $shouldOmitCalcChain = ! empty($this->pendingCellValues)
+                && $this->excelTemplate->statName('xl/calcChain.xml');
+            $shouldOmitCalcChain && $this->removeCalcChainPackageParts();
+
+            $excelTemplate = $this->excelTemplate;
+
+            $excelGenerate = new \ZipArchive;
+            if ($excelGenerate->open($generateName, \ZipArchive::CREATE) !== true) {
+                return false;
             }
+            $zipOpened = true;
 
-            if (isset($this->worksheetXml[$sheetName])) {
-                // 値を差し替えたシート：ストリーミング編集済みのテンポラリはaddFileでメモリ節約
-                $entry = $this->worksheetXml[$sheetName];
-                if (is_string($entry)) {
-                    $excelGenerate->addFile($entry, $sheetName);
-                } else {
-                    $excelGenerate->addFromString($sheetName, $entry->asXML());
+            for ($i = 0; $i < $excelTemplate->numFiles; $i++) {
+                $sheetName = $excelTemplate->getNameIndex($i);
+
+                if ($shouldOmitCalcChain && $sheetName === 'xl/calcChain.xml') {
+                    continue;
                 }
 
-                continue;
+                if ($sheetName == 'xl/workbook.xml') {
+                    $excelGenerate->addFromString($sheetName, $this->buildWorkbookXml($excelTemplate->getFromIndex($i)));
+
+                    continue;
+                }
+
+                if (isset($this->worksheetXml[$sheetName])) {
+                    // 値を差し替えたシート：ストリーミング編集済みのテンポラリはaddFileでメモリ節約
+                    // （差し替えるシートは、テンプレート側の内容を読み込まない）
+                    $entry = $this->worksheetXml[$sheetName];
+                    if (is_string($entry)) {
+                        $excelGenerate->addFile($entry, $sheetName);
+                    } else {
+                        $excelGenerate->addFromString($sheetName, $entry->asXML());
+                    }
+
+                    continue;
+                }
+
+                // テンプレートそのままのシートはZipからそのままコピーする
+                $excelGenerate->addFromString($sheetName, $excelTemplate->getFromIndex($i));
             }
 
-            // テンプレートそのままのシートはZipからそのままコピーする
-            $excelGenerate->addFromString($sheetName, $worksheetString);
-        }
-
-        if ($this->shouldAddSharedStrings) {
-            // 共有文字列のシートを追加して共有文字列を反映する
-            $excelGenerate->addFromString($this->sharedName, $this->worksheetXml[$this->sharedName]->asXML());
-        }
-
-        $excelTemplate->close();
-        $excelGenerate->close();
-        $this->templateLoaded = false;
-
-        $excelGenerated = file_get_contents($generateName);
-        is_file($generateName) && unlink($generateName);
-        is_file($tempName) && unlink($tempName);
-
-        // ストリーミング編集済みワークシートのテンポラリをクリーンアップ
-        foreach ($this->worksheetXml as $sheetName => $entry) {
-            if (is_string($entry)) {
-                is_file($entry) && unlink($entry);
+            if ($this->shouldAddSharedStrings) {
+                // 共有文字列のシートを追加して共有文字列を反映する
+                $excelGenerate->addFromString(self::SHARED_STRINGS_PATH, $this->worksheetXml[self::SHARED_STRINGS_PATH]->asXML());
             }
+
+            $excelTemplate->close();
+            $this->templateLoaded = false;
+
+            // addFile で渡したテンポラリは close() の時点で読み込まれる
+            $zipOpened = false;
+            $succeeded = $excelGenerate->close();
+
+            return $succeeded ? $generateName : false;
+        } finally {
+            if ($zipOpened) {
+                // 途中で例外が起きた場合。開いたままだと ZipArchive の破棄時にファイルが書き出されて残るため、
+                // ここで閉じてから削除する
+                try {
+                    @$excelGenerate->close();
+                } catch (\Throwable) {
+                }
+            }
+
+            is_file($tempName) && unlink($tempName);
+            $succeeded || (is_file($generateName) && unlink($generateName));
+
+            // ストリーミング編集済みワークシートのテンポラリをクリーンアップ（例外時も残さない）
+            foreach ($this->worksheetXml as $entry) {
+                is_string($entry) && is_file($entry) && unlink($entry);
+            }
+
+            // テンプレート由来のキャッシュは捨てるが、編集内容は残す（もう一度生成しても同じ内容になる）
+            // 生成に失敗した場合は、やり直せるよう「生成済み」にしない
+            $this->resetReadCaches();
+            $this->generated = $succeeded;
+        }
+    }
+
+    /**
+     * エクセルのシート名として使える文字列にする
+     */
+    private function sanitizeSheetName(string $sheetName): string
+    {
+        $sheetName = preg_replace('/[\[\]:*?\/\\\\]/u', '_', $this->sanitizeXmlText($sheetName));
+
+        // エクセルの上限は UTF-16 で31単位（絵文字などは1文字で2単位）
+        while (strlen(mb_convert_encoding($sheetName, 'UTF-16LE', 'UTF-8')) > 62) {
+            $sheetName = mb_substr($sheetName, 0, -1);
         }
 
-        $this->resetPackageCaches();
+        return trim($sheetName, "'");
+    }
 
-        return $excelGenerated;
+    /**
+     * セルへ書き込める値に変換する
+     *
+     * @return string|int|float|bool|null
+     */
+    private function normalizeCellValue($value)
+    {
+        if ($value === null || is_scalar($value)) {
+            return $value;
+        }
+
+        if ($value instanceof \DateTimeInterface) {
+            // エクセルの日時はシリアル値（1899-12-30 からの日数。時刻は小数部）。
+            // 日付として表示するには、テンプレート側のセルに日付の書式を設定しておく
+            $wallClock = new \DateTimeImmutable($value->format('Y-m-d H:i:s'), new \DateTimeZone('UTC'));
+            $epoch = new \DateTimeImmutable('1899-12-30 00:00:00', new \DateTimeZone('UTC'));
+
+            $serial = round(($wallClock->getTimestamp() - $epoch->getTimestamp()) / 86400, 10);
+
+            // エクセルは存在しない 1900-02-29 をシリアル値 60 として数えるため、それより前の日付は1日ずれる
+            // （1900-01-01 = 1、1900-02-28 = 59、1900-03-01 = 61）
+            return $serial < 61 ? $serial - 1 : $serial;
+        }
+
+        if ($value instanceof \Stringable) {
+            return (string) $value;
+        }
+
+        throw new \InvalidArgumentException('Unsupported cell value type: '.get_debug_type($value));
     }
 
     /**
@@ -219,20 +367,85 @@ trait ExcelSetTrait
 
         // シート名を変更する指定がある場合は反映する
         $modified = false;
+        $renamedSheets = [];
+        $sheetNodes = $this->workbookSheetNodes($workbookXml);
         foreach ($this->pendingSheetNames as $sheetNo => $newSheetName) {
-            if (isset($workbookXml->sheets[0]->sheet[$sheetNo - 1])) {
-                $workbookXml->sheets[0]->sheet[$sheetNo - 1]['name'] = $newSheetName;
-                $modified = true;
+            if (! isset($sheetNodes[$sheetNo - 1])) {
+                continue;
+            }
+
+            // 名前空間を指定して取得した要素では、名前空間なしの属性は attributes() で読む
+            $renamedSheets[(string) $sheetNodes[$sheetNo - 1]->attributes()->name] = $newSheetName;
+            dom_import_simplexml($sheetNodes[$sheetNo - 1])->setAttribute('name', $newSheetName);
+            $modified = true;
+        }
+        $this->renameSheetsInDefinedNames($workbookXml, $renamedSheets);
+
+        // エクセルはシート名の大文字と小文字を区別しない。同じ名前のシートがあるとファイルが壊れる
+        $finalNames = array_map(fn ($sheetNode) => mb_strtolower((string) $sheetNode->attributes()->name), $sheetNodes);
+        if ($renamedSheets && count($finalNames) !== count(array_unique($finalNames))) {
+            throw new \InvalidArgumentException('Duplicate sheet name');
+        }
+
+        // 開いたときに再計算させる設定を付与する（calcPrがないファイルはそのまま）
+        foreach ($workbookXml->children(self::MAIN_NS)->calcPr as $calcPr) {
+            foreach (['forceFullCalc', 'fullCalcOnLoad'] as $attributeName) {
+                if (! isset($calcPr->attributes()->{$attributeName})) {
+                    $calcPr->addAttribute($attributeName, 1);
+                    $modified = true;
+                }
             }
         }
 
-        // 開いたときに強制的に再計算させる設定を付与する（calcPrがないファイルはそのまま）
-        if (isset($workbookXml->calcPr) && ! isset($workbookXml->calcPr['forceFullCalc'])) {
-            $workbookXml->calcPr->addAttribute('forceFullCalc', 1);
-            $modified = true;
+        return $modified ? $workbookXml->asXML() : $workbookString;
+    }
+
+    /**
+     * 名前の定義（印刷範囲・フィルター範囲など）にある旧シート名への参照を、新しいシート名へ書き換える
+     * シート名の入れ替え（A→B と B→A）でも取り違えないよう、すべての変更を1回の置換で行う
+     *
+     * @param  array<string, string>  $renamedSheets  旧シート名 => 新シート名
+     */
+    private function renameSheetsInDefinedNames(\SimpleXMLElement $workbookXml, array $renamedSheets): void
+    {
+        $renamedSheets = array_filter($renamedSheets, fn ($newName, $oldName) => $newName !== (string) $oldName, ARRAY_FILTER_USE_BOTH);
+        if (! $renamedSheets) {
+            return;
         }
 
-        return $modified ? $workbookXml->asXML() : $workbookString;
+        // 記号や空白を含まない名前は 'Sheet1'!A1 ではなく Sheet1!A1 と書ける
+        $bareName = '[\p{L}_][\p{L}\p{N}_.]*';
+
+        $rename = function (array $matches) use ($renamedSheets, $bareName) {
+            // $matches[1]: 'Sheet 1'! のクォート内、$matches[2]: Sheet1! の名前
+            $oldName = ($matches[2] ?? '') !== '' ? $matches[2] : str_replace("''", "'", $matches[1]);
+            if (! isset($renamedSheets[$oldName])) {
+                return $matches[0];
+            }
+
+            $newName = $renamedSheets[$oldName];
+
+            return (preg_match('/^'.$bareName.'$/u', $newName) ? $newName : "'".str_replace("'", "''", $newName)."'").'!';
+        };
+
+        foreach ($workbookXml->children(self::MAIN_NS)->definedNames as $definedNames) {
+            foreach ($definedNames->children(self::MAIN_NS)->definedName as $definedName) {
+                $formula = (string) $definedName;
+
+                // 文字列リテラル（"..."）の中と、別のブックのシート（[1]Sheet1!）は書き換えない
+                $segments = preg_split('/("(?:""|[^"])*")/u', $formula, -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$formula];
+                foreach ($segments as $index => $segment) {
+                    if ($segment !== '' && $segment[0] !== '"') {
+                        $segments[$index] = preg_replace_callback('/\'((?:[^\']|\'\')+)\'!|(?<![\p{L}\p{N}_.\'\]])('.$bareName.')!/u', $rename, $segment) ?? $segment;
+                    }
+                }
+                $renamed = implode('', $segments);
+
+                if ($renamed !== $formula) {
+                    dom_import_simplexml($definedName)->textContent = $renamed;
+                }
+            }
+        }
     }
 
     /**
@@ -249,21 +462,30 @@ trait ExcelSetTrait
             return null;
         }
 
-        $targetRowNumbers = array_fill_keys(array_keys($pendingValues), true);
+        $this->droppedSharedFormulas = [];
+
+        // 値を設定する行番号（昇順）。書き出した行から順に取り除いていく
+        $pendingRowNumbers = array_keys($pendingValues);
+        sort($pendingRowNumbers, SORT_NUMERIC);
+        $pendingIndex = 0;
 
         $outPath = $this->createTempFileName();
         $writer = fopen($outPath, 'w');
-        if (! $writer) {
-            $tempToCleanup && is_file($tempToCleanup) && unlink($tempToCleanup);
+        $reader = new XMLReader;
+        $succeeded = false;
 
-            return null;
-        }
+        // テンプレートにない行を、$beforeRow より前の分だけ新しい行として書き出す（null なら残りすべて）
+        // xlsxの行は昇順である必要があるため、既存の行の間に行番号順で差し込む
+        $writeNewRows = function (?int $beforeRow) use (&$pendingIndex, $pendingRowNumbers, $pendingValues, $writer) {
+            while (isset($pendingRowNumbers[$pendingIndex]) && ($beforeRow === null || $pendingRowNumbers[$pendingIndex] < $beforeRow)) {
+                $rowNumber = $pendingRowNumbers[$pendingIndex++];
+                // 名前空間を明示する（シートが <x:worksheet> のようにプレフィックス付きでも、正しい要素になる）
+                fwrite($writer, $this->applyValuesToRowXml('<row xmlns="'.self::MAIN_NS.'"/>', (string) $rowNumber, $pendingValues[$rowNumber]));
+            }
+        };
 
         try {
-            $reader = new XMLReader;
-            if (! $reader->open($sourceUri)) {
-                is_file($outPath) && unlink($outPath);
-
+            if (! $writer || ! $reader->open($sourceUri)) {
                 return null;
             }
 
@@ -271,108 +493,73 @@ trait ExcelSetTrait
             $expectedRow = 1;
 
             while ($reader->read()) {
-                if ($reader->nodeType === XMLReader::PI && $reader->name === 'xml') {
-                    fwrite($writer, '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'."\n");
+                $isElement = $reader->nodeType === XMLReader::ELEMENT;
+                $isMainElement = $isElement && $reader->namespaceURI === self::MAIN_NS;
 
-                    continue;
+                if ($isElement && $reader->depth === 0 && ! ($isMainElement && $reader->localName === 'worksheet')) {
+                    // グラフシートなど、ワークシート以外は編集しない（そのまま出力する）
+                    return null;
                 }
 
-                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'worksheet' && $reader->namespaceURI === self::MAIN_NS) {
+                if ($isMainElement && $reader->localName === 'worksheet') {
                     fwrite($writer, '<'.$reader->name.$this->readerAttributesToXml($reader).'>');
-
-                    continue;
-                }
-
-                if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'worksheet') {
+                } elseif ($reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'worksheet') {
                     fwrite($writer, '</'.$reader->name.'>');
+                } elseif ($isMainElement && $reader->localName === 'sheetData') {
+                    // 要素名はテンプレートのもの（名前空間プレフィックス付きのこともある）をそのまま使う
+                    $sheetDataName = $reader->name;
+                    $inSheetData = ! $reader->isEmptyElement;
+                    fwrite($writer, '<'.$sheetDataName.$this->readerAttributesToXml($reader).'>');
 
-                    continue;
-                }
-
-                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'sheetData' && $reader->namespaceURI === self::MAIN_NS) {
-                    fwrite($writer, '<sheetData'.$this->readerAttributesToXml($reader).'>');
-
-                    if ($reader->isEmptyElement) {
+                    if (! $inSheetData) {
                         // 空シートの<sheetData/>（自己終了タグ）はEND_ELEMENTが来ないため、
                         // ここで追記行をすべて書き出して閉じる
-                        $this->writePendingRows($writer, $pendingValues, array_keys($targetRowNumbers));
-                        $targetRowNumbers = [];
-                        fwrite($writer, '</sheetData>');
-                    } else {
-                        $inSheetData = true;
+                        $writeNewRows(null);
+                        fwrite($writer, '</'.$sheetDataName.'>');
                     }
-
-                    continue;
-                }
-
-                if ($inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'row' && $reader->namespaceURI === self::MAIN_NS) {
+                } elseif ($inSheetData && $isMainElement && $reader->localName === 'row') {
                     $rowRef = $reader->getAttribute('r');
                     $rowNum = $rowRef ? (int) $rowRef : $expectedRow;
-
-                    // 既存行の手前に挿入する追記行を書き出す
-                    for ($r = $expectedRow; $r < $rowNum; $r++) {
-                        if (! empty($pendingValues[(string) $r])) {
-                            fwrite($writer, $this->applyValuesToRowXml('<row/>', (string) $r, $pendingValues[(string) $r]));
-                        }
-                    }
                     $expectedRow = $rowNum + 1;
 
-                    if (isset($targetRowNumbers[(string) $rowNum])) {
-                        fwrite($writer, $this->applyValuesToRowXml($reader->readOuterXml(), (string) $rowNum, $pendingValues[$rowNum] ?? []));
-                        unset($targetRowNumbers[(string) $rowNum]);
+                    // 既存行の手前に挿入する追記行を書き出す
+                    $writeNewRows($rowNum);
+
+                    $rowXml = $reader->readOuterXml();
+                    if (isset($pendingValues[$rowNum])) {
+                        // 行番号が昇順でないシートでは、この行を追記行として書き出し済みのことがある。
+                        // その場合も、既存の行を古い値のまま残さない
+                        ($pendingRowNumbers[$pendingIndex] ?? null) === $rowNum && $pendingIndex++;
+                        fwrite($writer, $this->applyValuesToRowXml($rowXml, (string) $rowNum, $pendingValues[$rowNum]));
+                    } elseif ($this->droppedSharedFormulas && str_contains($rowXml, 'shared')) {
+                        // 上書きされたマスターを参照する共有数式を、通常の数式に展開する
+                        fwrite($writer, $this->applyValuesToRowXml($rowXml, (string) $rowNum, []));
                     } else {
-                        fwrite($writer, $reader->readOuterXml());
+                        fwrite($writer, $rowXml);
                     }
-
-                    continue;
-                }
-
-                if ($inSheetData && $reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'sheetData') {
+                } elseif ($inSheetData && $reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'sheetData') {
                     // 最終行より後ろの追記行を書き出す
-                    $this->writePendingRows($writer, $pendingValues, array_keys($targetRowNumbers), $expectedRow - 1);
-                    fwrite($writer, '</sheetData>');
+                    $writeNewRows(null);
+                    fwrite($writer, '</'.$reader->name.'>');
                     $inSheetData = false;
-
-                    continue;
-                }
-
-                // sheetData外の要素はworksheet直下（depth 1）のみ丸ごとコピーする。
-                // readOuterXml()はリーダーを進めないため、depth 2以下も対象にすると
-                // 直後のread()で子要素に降りて同じ内容が重複して書き出されてしまう
-                if (! $inSheetData && $reader->nodeType === XMLReader::ELEMENT && $reader->depth === 1) {
+                } elseif (! $inSheetData && $isElement && $reader->depth === 1) {
+                    // sheetData外の要素はworksheet直下（depth 1）のみ丸ごとコピーする。
+                    // readOuterXml()はリーダーを進めないため、depth 2以下も対象にすると
+                    // 直後のread()で子要素に降りて同じ内容が重複して書き出されてしまう
                     fwrite($writer, $reader->readOuterXml());
-
-                    continue;
                 }
             }
 
-            $reader->close();
+            $succeeded = true;
+
+            return $outPath;
         } finally {
-            fclose($writer);
-            if ($tempToCleanup !== null && is_file($tempToCleanup)) {
-                unlink($tempToCleanup);
-            }
-        }
+            $reader->close();
+            $writer && fclose($writer);
+            $tempToCleanup !== null && is_file($tempToCleanup) && unlink($tempToCleanup);
 
-        return $outPath;
-    }
-
-    /**
-     * まだ書き出していない追記行を行番号の昇順で書き出す
-     *
-     * @param  resource  $writer
-     * @param  array<int, int|string>  $rowKeys  書き出し対象の行番号
-     * @param  int  $afterRow  この行番号より後の行のみ書き出す
-     */
-    private function writePendingRows($writer, array $pendingValues, array $rowKeys, int $afterRow = 0): void
-    {
-        // 挿入順ではなく行番号順で書き出す（xlsxの行は昇順である必要がある）
-        sort($rowKeys, SORT_NUMERIC);
-
-        foreach ($rowKeys as $rowKey) {
-            if ((int) $rowKey > $afterRow && ! empty($pendingValues[$rowKey])) {
-                fwrite($writer, $this->applyValuesToRowXml('<row/>', (string) $rowKey, $pendingValues[$rowKey]));
-            }
+            // 失敗した場合や途中で例外が起きた場合は、書きかけのテンポラリを残さない
+            $succeeded || (is_file($outPath) && unlink($outPath));
         }
     }
 
@@ -416,11 +603,23 @@ trait ExcelSetTrait
 
         $rowNode->setAttribute('r', $rowName);
 
+        // r属性のないセルは、読み取りと同じ規則（直前のセルの次の列）で位置を補う
+        // （補わないと、値の照合ができず、並べ替えのときに同じ位置とみなされてセルが失われる）
+        $nextColumnIndex = 0;
+        foreach ($xpath->query('./main:c', $rowNode) as $cellNode) {
+            /** @var \DOMElement $cellNode */
+            if ($cellNode->getAttribute('r') === '') {
+                $cellNode->setAttribute('r', $this->resolveColumnName($nextColumnIndex).$rowName);
+            }
+            $nextColumnIndex = $this->columnNameToIndex($cellNode->getAttribute('r')) + 1;
+        }
+
         // 既存セルは値を差し替える
         foreach ($xpath->query('.//main:c', $rowNode) as $cellNode) {
             /** @var \DOMElement $cellNode */
             $cellName = $cellNode->getAttribute('r');
-            if ($cellName === '' || ! isset($pendingValues[$cellName])) {
+            // 値が null（セルを空にする指定）のこともあるので、キーの有無で判定する
+            if ($cellName === '' || ! array_key_exists($cellName, $pendingValues)) {
                 continue;
             }
             $this->applyCellValueToDom($cellNode, $pendingValues[$cellName]);
@@ -435,9 +634,38 @@ trait ExcelSetTrait
             $rowNode->appendChild($cellNode);
         }
 
+        $this->expandOrphanSharedFormulas($rowNode, $xpath);
+
         $this->sortRowCellsDom($rowNode, $xpath);
 
         return $dom->saveXML($rowNode);
+    }
+
+    /**
+     * 上書きでマスターを失った共有数式のメンバーセルを、通常の数式に展開する
+     * （マスターの式がないままだと、メンバーセルの数式が失われる）
+     */
+    private function expandOrphanSharedFormulas(\DOMElement $rowNode, \DOMXPath $xpath): void
+    {
+        if (! $this->droppedSharedFormulas) {
+            return;
+        }
+
+        foreach ($xpath->query('./main:c/main:f[@t="shared"]', $rowNode) as $formulaNode) {
+            /** @var \DOMElement $formulaNode */
+            $master = $this->droppedSharedFormulas[(int) $formulaNode->getAttribute('si')] ?? null;
+            if ($master === null || trim($formulaNode->textContent) !== '') {
+                continue;
+            }
+
+            /** @var \DOMElement $cellNode */
+            $cellNode = $formulaNode->parentNode;
+
+            foreach (['t', 'si', 'ref'] as $attributeName) {
+                $formulaNode->removeAttribute($attributeName);
+            }
+            $formulaNode->textContent = $this->translateFormulaReferences($master['formula'], $master['cell'], $cellNode->getAttribute('r'));
+        }
     }
 
     /**
@@ -447,6 +675,17 @@ trait ExcelSetTrait
     {
         $cellNode->removeAttribute('t');
 
+        // 共有数式のマスター（式の本体を持つセル）を上書きする場合は、
+        // 同じ式を共有しているセルを後で通常の数式に展開できるよう、式を控えておく
+        foreach ($cellNode->getElementsByTagNameNS(self::MAIN_NS, 'f') as $formulaNode) {
+            if ($formulaNode->getAttribute('t') === 'shared' && trim($formulaNode->textContent) !== '') {
+                $this->droppedSharedFormulas[(int) $formulaNode->getAttribute('si')] = [
+                    'cell' => $cellNode->getAttribute('r'),
+                    'formula' => $formulaNode->textContent,
+                ];
+            }
+        }
+
         // 既存の値・数式・インライン文字列を削除する
         // （数式を残すと再計算時に設定した値が上書きされてしまう）
         foreach (['v', 'f', 'is'] as $childName) {
@@ -455,8 +694,21 @@ trait ExcelSetTrait
             }
         }
 
+        if ($value === null) {
+            // null は空のセルにする（書式は残す）
+            return;
+        }
+
         $vNode = $cellNode->ownerDocument->createElementNS(self::MAIN_NS, 'v');
         $cellNode->appendChild($vNode);
+
+        if (is_bool($value)) {
+            // 真偽値はエクセルの論理値（TRUE / FALSE）として書き込む
+            $cellNode->setAttribute('t', 'b');
+            $vNode->textContent = $value ? '1' : '0';
+
+            return;
+        }
 
         if (is_string($value)) {
             $value = $this->sanitizeXmlText($value);
@@ -465,7 +717,8 @@ trait ExcelSetTrait
         }
 
         if ($this->shouldStoreAsNumber($value)) {
-            $vNode->textContent = $value;
+            // float はエクセルが保持する有効15桁で書き込む（既定の文字列化は14桁で、1桁失われる）
+            $vNode->textContent = is_float($value) ? sprintf('%.15H', $value) : $value;
 
             return;
         }
@@ -535,13 +788,14 @@ trait ExcelSetTrait
         $this->sharedStringsLoaded = true;
 
         // 共有文字列XMLを読み込む（存在しない場合は初期化する）
-        $sharedXml = $this->loadWorksheetXml($this->sharedName);
+        $sharedXml = $this->loadWorksheetXml(self::SHARED_STRINGS_PATH);
         $sharedXml === false && $sharedXml = $this->initializeSharedStrings();
 
         // 値からインデックスへのO(1)ルックアップ用マップを構築する
         $this->sharedStringsMap = [];
         $this->sharedStringsCount = 0;
-        foreach ($sharedXml->si as $sharedSi) {
+        // 要素に名前空間プレフィックスが付いていても取得できるよう、名前空間を指定して子要素を取る
+        foreach ($sharedXml->children(self::MAIN_NS)->si as $sharedSi) {
             $this->sharedStringsMap[$this->sharedStringSiText($sharedSi)] = $this->sharedStringsCount++;
         }
     }
@@ -552,14 +806,15 @@ trait ExcelSetTrait
      */
     private function sharedStringSiText(\SimpleXMLElement $sharedSi): string
     {
-        if (isset($sharedSi->t)) {
-            return str_replace('_x000D_', '', strval($sharedSi->t));
+        $children = $sharedSi->children(self::MAIN_NS);
+        if (isset($children->t)) {
+            return str_replace('_x000D_', '', strval($children->t));
         }
 
         // リッチテキストはラン（r）内のtを連結する（ふりがなrPhは含めない）
         $string = '';
-        foreach ($sharedSi->r as $run) {
-            $string .= strval($run->t);
+        foreach ($children->r as $run) {
+            $string .= strval($run->children(self::MAIN_NS)->t);
         }
 
         return str_replace('_x000D_', '', $string);
@@ -583,27 +838,39 @@ trait ExcelSetTrait
             return false;
         }
 
+        // エクセルが保持できるのは有効15桁まで。カード番号やIDのように桁数の多い数字は、
+        // 数値にすると末尾の桁が失われるため文字列として保存する
+        if (strlen(ltrim(preg_replace('/\D/', '', $value), '0')) > 15) {
+            return false;
+        }
+
+        // '1e400' のように数値として表せない文字列は、文字列として保存する
+        if (! is_finite((float) $value)) {
+            return false;
+        }
+
         return $this->normalizeNumericCellValue($value) === $value;
     }
 
     private function updateSharedStringsXml()
     {
         // 共有文字列XMLを読み込み、カウントを更新する
-        $sharedXml = $this->loadWorksheetXml($this->sharedName);
+        $sharedXml = $this->loadWorksheetXml(self::SHARED_STRINGS_PATH);
 
         $sharedXml['count'] = intval($sharedXml['count']) + count($this->pendingSharedStrings);
         $sharedXml['uniqueCount'] = intval($sharedXml['uniqueCount']) + count($this->pendingSharedStrings);
 
         // 共有文字列XMLへ新しい文字列を追加する（addChildは&をエスケープしないため事前に変換）
         foreach ($this->pendingSharedStrings as $value) {
-            $addString = $sharedXml->addChild('si');
-            $tNode = $addString->addChild('t', str_replace('&', '&amp;', $value));
+            // テンプレートと同じ名前空間（プレフィックス付きならそのプレフィックス）で追加する
+            $addString = $sharedXml->addChild('si', null, self::MAIN_NS);
+            $tNode = $addString->addChild('t', str_replace('&', '&amp;', $value), self::MAIN_NS);
             if ($tNode && (string) $value !== trim((string) $value, " \t\n\r")) {
                 $tNode->addAttribute('xml:space', 'preserve', 'http://www.w3.org/XML/1998/namespace');
             }
         }
 
-        $this->worksheetXml[$this->sharedName] = $sharedXml;
+        $this->worksheetXml[self::SHARED_STRINGS_PATH] = $sharedXml;
     }
 
     /**
@@ -655,8 +922,8 @@ trait ExcelSetTrait
 
         $sharedString = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'."\n"
             .'<sst xmlns="'.self::MAIN_NS.'" count="0" uniqueCount="0"></sst>';
-        $this->worksheetXml[$this->sharedName] = new \SimpleXMLElement($sharedString);
+        $this->worksheetXml[self::SHARED_STRINGS_PATH] = new \SimpleXMLElement($sharedString);
 
-        return $this->worksheetXml[$this->sharedName];
+        return $this->worksheetXml[self::SHARED_STRINGS_PATH];
     }
 }
